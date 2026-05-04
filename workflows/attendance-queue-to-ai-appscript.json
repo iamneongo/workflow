@@ -1,0 +1,370 @@
+{
+  "name": "Attendance Queue -> AI -> Apps Script",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "b64d632d-2c3d-4a4d-9989-6eb0cd2ea95d",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        260,
+        320
+      ],
+      "notes": "Moi 5 phut quet queue pending va xu ly lai cac tin nhan chua xong."
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "mode": "id",
+          "value": "dad3ca9f-2474-4abc-bbf8-51e85f81eafa"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "status",
+              "condition": "eq",
+              "keyValue": "pending"
+            }
+          ]
+        },
+        "returnAll": false,
+        "limit": 10
+      },
+      "id": "dc09abda-f43a-4893-84df-1f9cb1bca205",
+      "name": "Get Pending Queue Rows",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        560,
+        320
+      ],
+      "notes": "Chi lay cac ban ghi con pending. Neu mot lan xu ly loi, record van o day de lan sau nhat lai."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "return {\n  json: {\n    ...$json,\n  },\n};"
+      },
+      "id": "7f25bfea-bd10-4c02-b7eb-2ce06f5c24cf",
+      "name": "Hydrate Queue Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        320
+      ],
+      "notes": "Dua du lieu trong queue ve lai schema de prompt AI doc on dinh."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "return {\n  json: {\n    ...$json,\n    retry_count: Number($json.retry_count || 0) + 1,\n    last_error: '',\n  },\n};"
+      },
+      "id": "e19fd1ec-7835-4d97-a6a8-1273a3ea01fd",
+      "name": "Increment Retry Counter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1160,
+        320
+      ],
+      "notes": "Tang retry_count truoc khi goi AI. Neu run nay loi, queue van ghi nhan so lan da thu."
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "update",
+        "dataTableId": {
+          "mode": "id",
+          "value": "dad3ca9f-2474-4abc-bbf8-51e85f81eafa"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "thread_id",
+              "condition": "eq",
+              "keyValue": "={{String($json.thread_id)}}"
+            },
+            {
+              "keyName": "message_ts",
+              "condition": "eq",
+              "keyValue": "={{String($json.message_ts)}}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": null
+        },
+        "options": {}
+      },
+      "id": "47db3b6b-201a-4b86-9fb6-72a78350d591",
+      "name": "Save Attempt Count",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        1460,
+        320
+      ],
+      "notes": "Luu retry_count ngay ca khi AI/Apps Script that bai sau do."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "return {\n  json: {\n    ...$json,\n    threadId: String($json.thread_id ?? ''),\n    groupName: String($json.group_name ?? ''),\n    senderId: String($json.sender_id ?? ''),\n    senderName: String($json.sender_name ?? ''),\n    messageText: String($json.message_text ?? ''),\n    messageTs: String($json.message_ts ?? ''),\n  },\n};"
+      },
+      "id": "15b2da59-c5cf-4976-8b52-c9e277f2f32d",
+      "name": "Hydrate Gemini Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1610,
+        320
+      ],
+      "notes": "Sau khi update queue, tao lai cac field camelCase de prompt Gemini dung du lieu dung ten."
+    },
+    {
+      "parameters": {
+        "resource": "text",
+        "operation": "message",
+        "modelId": {
+          "mode": "id",
+          "value": "models/gemini-2.5-flash"
+        },
+        "messages": {
+          "values": [
+            {
+              "role": "user",
+              "content": "={{\"Return exactly ONE compact JSON object on a single line. No markdown, no explanation, no code fence.\\n\\nThis workflow is ONLY for attendance extraction from Vietnamese Zalo messages.\\n\\nRequired top-level keys in this exact order: thread_id, group_name, sender_id, sender_name, message_text, message_ts, summary, document_type, confidence, needs_human_review, attendance_entries, notes.\\n\\nAllowed values:\\n- document_type: attendance|other\\n- needs_human_review: true or false\\n- confidence: number from 0 to 1\\n\\nRules:\\n- Copy thread_id, group_name, sender_id, sender_name, message_text, message_ts exactly from input\\n- If the message is not about attendance, set document_type=other and attendance_entries=[]\\n- summary: short Vietnamese summary, max 140 characters\\n- Extract one attendance_entries item per worker or attendance record you can identify\\n- If the message mentions attendance but is incomplete or ambiguous, still extract what you can and set needs_human_review=true\\n- Unknown text fields must be empty string\\n- Unknown numeric fields must be 0\\n- Dates must use YYYY-MM-DD if known, otherwise empty string\\n- Time fields should be HH:mm if known, otherwise empty string\\n- notes must be an array of short Vietnamese strings describing assumptions or ambiguities\\n\\nUseful hints for Vietnamese attendance messages:\\n- 'ca ngay' usually means full-day work\\n- 'nua ngay', 'sang', 'chieu' may indicate partial shifts\\n- 'tang ca' usually means overtime\\n- team names, cong trinh names, khu vuc, to/nhom thi cong should go to site or task when suitable\\n\\nSchema for attendance_entries items:\\n{\\n  \\\"employee_name\\\": \\\"\\\",\\n  \\\"work_date\\\": \\\"\\\",\\n  \\\"shift\\\": \\\"\\\",\\n  \\\"start_time\\\": \\\"\\\",\\n  \\\"end_time\\\": \\\"\\\",\\n  \\\"hours\\\": 0,\\n  \\\"overtime_hours\\\": 0,\\n  \\\"site\\\": \\\"\\\",\\n  \\\"task\\\": \\\"\\\",\\n  \\\"status\\\": \\\"\\\",\\n  \\\"note\\\": \\\"\\\"\\n}\\n\\nInput:\\nthread_id: \" + $json.threadId + \"\\ngroup_name: \" + $json.groupName + \"\\nsender_id: \" + $json.senderId + \"\\nsender_name: \" + $json.senderName + \"\\nmessage_ts: \" + $json.messageTs + \"\\nmessage_text: \" + $json.messageText}}"
+            }
+          ]
+        },
+        "simplify": true,
+        "jsonOutput": true,
+        "options": {
+          "systemMessage": "You extract structured attendance records from Vietnamese Zalo messages. Always return one compact valid JSON object only.",
+          "temperature": 0,
+          "maxOutputTokens": 1800,
+          "topP": 0.8,
+          "topK": 10
+        }
+      },
+      "id": "e14e9ab1-a801-48d8-b27b-fd4977a896e7",
+      "name": "Google Gemini",
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1,
+      "position": [
+        1760,
+        320
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "nAgWqub1HztVDWc9",
+          "name": "Google Gemini API Local"
+        }
+      },
+      "notes": "Node nay da co retry noi bo de chiu duoc 503/rate limit ngan han.",
+      "retryOnFail": true,
+      "maxTries": 8,
+      "waitBetweenTries": 15000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "const normalizeText = (value) => String(value ?? '').trim();\nconst normalizeNumber = (value) => {\n  const num = Number(value ?? 0);\n  return Number.isFinite(num) ? num : 0;\n};\nconst normalizeDate = (value) => {\n  const text = normalizeText(value);\n  return /^\\d{4}-\\d{2}-\\d{2}$/.test(text) ? text : '';\n};\nconst normalizeTime = (value) => {\n  const text = normalizeText(value);\n  return /^\\d{2}:\\d{2}$/.test(text) ? text : '';\n};\nconst asArray = (value) => Array.isArray(value) ? value : [];\n\nconst finishReason = $json?.finishReason ?? '';\nconst parts = $json?.content?.parts ?? [];\nconst textPart = parts.find((part) => typeof part?.text === 'string')?.text ?? '';\n\nlet clean = textPart\n  .replace(/^```json\\s*/i, '')\n  .replace(/^```/i, '')\n  .replace(/```$/i, '')\n  .trim();\n\nconst firstBrace = clean.indexOf('{');\nconst lastBrace = clean.lastIndexOf('}');\nif (firstBrace !== -1 && lastBrace > firstBrace) {\n  clean = clean.slice(firstBrace, lastBrace + 1);\n}\n\nlet data;\ntry {\n  data = JSON.parse(clean);\n} catch (error) {\n  throw new Error(`Gemini did not return valid JSON. Finish reason: ${finishReason}. Raw output: ${clean}`);\n}\n\nconst attendanceEntries = asArray(data.attendance_entries).map((entry) => ({\n  employee_name: normalizeText(entry?.employee_name),\n  work_date: normalizeDate(entry?.work_date),\n  shift: normalizeText(entry?.shift),\n  start_time: normalizeTime(entry?.start_time),\n  end_time: normalizeTime(entry?.end_time),\n  hours: normalizeNumber(entry?.hours),\n  overtime_hours: normalizeNumber(entry?.overtime_hours),\n  site: normalizeText(entry?.site),\n  task: normalizeText(entry?.task),\n  status: normalizeText(entry?.status),\n  note: normalizeText(entry?.note),\n})).filter((entry) => entry.employee_name || entry.work_date || entry.site || entry.task || entry.hours || entry.overtime_hours);\n\nconst notes = asArray(data.notes).map((note) => normalizeText(note)).filter(Boolean);\nconst documentType = normalizeText(data.document_type) || 'other';\nlet queueStatus = 'ignored';\nif (documentType === 'attendance' && attendanceEntries.length > 0) {\n  queueStatus = 'done';\n} else if (documentType === 'attendance' || Boolean(data.needs_human_review)) {\n  queueStatus = 'needs_review';\n}\n\nreturn {\n  json: {\n    ...$input.item.json,\n    finish_reason: normalizeText(finishReason),\n    summary: normalizeText(data.summary),\n    document_type: documentType,\n    confidence: normalizeNumber(data.confidence),\n    needs_human_review: Boolean(data.needs_human_review),\n    attendance_entries: attendanceEntries,\n    main_material_entries: [],\n    sub_material_entries: [],\n    attendance_count: attendanceEntries.length,\n    main_material_count: 0,\n    sub_material_count: 0,\n    notes,\n    status: queueStatus,\n    processed_at: new Date().toISOString(),\n    attendance_json: JSON.stringify(attendanceEntries),\n    appscript_action: {\n      mode: 'route_attendance',\n      targets: ['ChamCong'],\n    },\n    raw_ai_json: clean,\n  },\n};"
+      },
+      "id": "a665dc2b-8d59-48d3-9699-c23b0a0c39b5",
+      "name": "Parse Attendance JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2060,
+        320
+      ],
+      "notes": "Neu AI ket luan khong phai cham cong, record se duoc danh dau ignored/needs_review thay vi retry mai."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "language": "javaScript",
+        "jsCode": "const pickQueueFields = (input, overrides = {}) => ({\n  id: input.id,\n  queue_key: String(input.queue_key ?? ''),\n  thread_id: String(input.thread_id ?? ''),\n  group_name: String(input.group_name ?? ''),\n  sender_id: String(input.sender_id ?? ''),\n  sender_name: String(input.sender_name ?? ''),\n  message_text: String(input.message_text ?? ''),\n  message_ts: String(input.message_ts ?? ''),\n  raw_message_json: String(input.raw_message_json ?? ''),\n  status: String(input.status ?? 'pending'),\n  retry_count: Number(input.retry_count ?? 0),\n  last_error: String(input.last_error ?? ''),\n  processed_at: input.processed_at ?? null,\n  summary: String(input.summary ?? ''),\n  attendance_json: String(input.attendance_json ?? ''),\n  needs_human_review: Boolean(input.needs_human_review),\n  confidence: Number(input.confidence ?? 0),\n  appscript_response: String(input.appscript_response ?? ''),\n  ...overrides,\n});\n\nif ($json.document_type !== 'attendance' || !Array.isArray($json.attendance_entries) || $json.attendance_entries.length === 0) {\n  return {\n    json: pickQueueFields($json, {\n      appscript_response: JSON.stringify({ skipped: true, reason: 'non-attendance-or-empty' }),\n    }),\n  };\n}\n\nconst url = 'https://script.google.com/macros/s/AKfycbyzC-qw38puhlm5btycJs6ohYXArbRWBF7j70o0zU4MeHCWaoKjXM4BN4XXZXveHsgD/exec';\nconst response = await helpers.httpRequest({\n  method: 'POST',\n  url,\n  headers: {\n    'Content-Type': 'application/json',\n  },\n  body: $json,\n  json: true,\n});\n\nreturn {\n  json: pickQueueFields($json, {\n    appscript_response: typeof response === 'string' ? response : JSON.stringify(response),\n  }),\n};"
+      },
+      "id": "92b43201-6b2f-40a9-ad53-bf70c58ded0f",
+      "name": "Send Attendance to Apps Script",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2360,
+        320
+      ],
+      "notes": "Chi gui Apps Script khi AI da parse ra cham cong. Loi HTTP se giu record o pending de lan sau xu ly lai."
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "update",
+        "dataTableId": {
+          "mode": "id",
+          "value": "dad3ca9f-2474-4abc-bbf8-51e85f81eafa"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "thread_id",
+              "condition": "eq",
+              "keyValue": "={{String($json.thread_id)}}"
+            },
+            {
+              "keyName": "message_ts",
+              "condition": "eq",
+              "keyValue": "={{String($json.message_ts)}}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": null
+        },
+        "options": {}
+      },
+      "id": "bfcd3e5a-a1a8-4fd8-a5a1-7e22cfeaf95a",
+      "name": "Mark Queue Row Complete",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        2660,
+        320
+      ],
+      "notes": "Chi danh dau done/ignored/needs_review sau khi toan bo buoc can thiet da xong."
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Pending Queue Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Pending Queue Rows": {
+      "main": [
+        [
+          {
+            "node": "Hydrate Queue Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hydrate Queue Payload": {
+      "main": [
+        [
+          {
+            "node": "Increment Retry Counter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Increment Retry Counter": {
+      "main": [
+        [
+          {
+            "node": "Save Attempt Count",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Attempt Count": {
+      "main": [
+        [
+          {
+            "node": "Hydrate Gemini Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hydrate Gemini Input": {
+      "main": [
+        [
+          {
+            "node": "Google Gemini",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini": {
+      "main": [
+        [
+          {
+            "node": "Parse Attendance JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Attendance JSON": {
+      "main": [
+        [
+          {
+            "node": "Send Attendance to Apps Script",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Attendance to Apps Script": {
+      "main": [
+        [
+          {
+            "node": "Mark Queue Row Complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
+

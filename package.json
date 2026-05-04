@@ -1,0 +1,19 @@
+{
+  "name": "n8n-local-stable",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "n8n start",
+    "start:debug": "n8n start --verbose",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "n8n": "1.123.31",
+    "n8n-nodes-zalo-tools": "^0.6.1"
+  }
+}

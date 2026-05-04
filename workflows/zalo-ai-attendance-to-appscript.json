@@ -1,0 +1,183 @@
+{
+  "name": "Zalo -> AI Attendance -> Apps Script",
+  "nodes": [
+    {
+      "parameters": {
+        "eventTypes": [
+          1
+        ],
+        "selfListen": false
+      },
+      "id": "9e9e8614-c0a0-4ef6-8e36-6e6268d14f11",
+      "name": "Zalo Message Trigger",
+      "type": "n8n-nodes-zalo-tools.zaloMessageTrigger",
+      "typeVersion": 1,
+      "credentials": {
+        "zaloApi": {
+          "id": "ZiSsMyUEkndy1TDP",
+          "name": "Zalo API Credentials"
+        }
+      },
+      "position": [
+        260,
+        320
+      ],
+      "notes": "Nghe tin nhan text moi tu Zalo bang credential zaloApi hien co."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const out = [];\nfor (const item of items) {\n  const message = item.json?.message;\n  const text = message?.data?.content;\n  if (message?.isSelf) continue;\n  if (typeof text !== 'string' || !text.trim()) continue;\n\n  out.push({\n    json: {\n      threadId: String(message.threadId ?? ''),\n      threadType: String(message.type ?? ''),\n      groupName: String(message.data?.dName ?? ''),\n      senderId: String(message.data?.uidFrom ?? ''),\n      senderName: String(message.data?.dName ?? ''),\n      messageText: text.trim(),\n      messageTs: String(message.data?.ts ?? ''),\n      messageId: String(message.data?.msgId ?? ''),\n      rawMessage: message,\n    },\n  });\n}\nreturn out;"
+      },
+      "id": "9b4877ef-cc3e-4c29-9f0f-fd20d7581141",
+      "name": "Normalize Zalo Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        320
+      ],
+      "notes": "Loc tin nhan text va dua ve schema gon truoc khi gui sang AI."
+    },
+    {
+      "parameters": {
+        "resource": "text",
+        "operation": "message",
+        "modelId": {
+          "mode": "id",
+          "value": "models/gemini-2.5-flash"
+        },
+        "messages": {
+          "values": [
+            {
+              "role": "user",
+              "content": "={{\"Return exactly ONE compact JSON object on a single line. No markdown, no explanation, no code fence.\\n\\nThis workflow is ONLY for attendance extraction from Vietnamese Zalo messages.\\n\\nRequired top-level keys in this exact order: thread_id, group_name, sender_id, sender_name, message_text, message_ts, summary, document_type, confidence, needs_human_review, attendance_entries, notes.\\n\\nAllowed values:\\n- document_type: attendance|other\\n- needs_human_review: true or false\\n- confidence: number from 0 to 1\\n\\nRules:\\n- Copy thread_id, group_name, sender_id, sender_name, message_text, message_ts exactly from input\\n- If the message is not about attendance, set document_type=other and attendance_entries=[]\\n- summary: short Vietnamese summary, max 140 characters\\n- Extract one attendance_entries item per worker or attendance record you can identify\\n- If the message mentions attendance but is incomplete or ambiguous, still extract what you can and set needs_human_review=true\\n- Unknown text fields must be empty string\\n- Unknown numeric fields must be 0\\n- Dates must use YYYY-MM-DD if known, otherwise empty string\\n- Time fields should be HH:mm if known, otherwise empty string\\n- notes must be an array of short Vietnamese strings describing assumptions or ambiguities\\n\\nUseful hints for Vietnamese attendance messages:\\n- 'ca ngay' usually means full-day work\\n- 'nua ngay', 'sang', 'chieu' may indicate partial shifts\\n- 'tang ca' usually means overtime\\n- team names, cong trinh names, khu vuc, to/nhom thi cong should go to site or task when suitable\\n\\nSchema for attendance_entries items:\\n{\\n  \\\"employee_name\\\": \\\"\\\",\\n  \\\"work_date\\\": \\\"\\\",\\n  \\\"shift\\\": \\\"\\\",\\n  \\\"start_time\\\": \\\"\\\",\\n  \\\"end_time\\\": \\\"\\\",\\n  \\\"hours\\\": 0,\\n  \\\"overtime_hours\\\": 0,\\n  \\\"site\\\": \\\"\\\",\\n  \\\"task\\\": \\\"\\\",\\n  \\\"status\\\": \\\"\\\",\\n  \\\"note\\\": \\\"\\\"\\n}\\n\\nInput:\\nthread_id: \" + $json.threadId + \"\\ngroup_name: \" + $json.groupName + \"\\nsender_id: \" + $json.senderId + \"\\nsender_name: \" + $json.senderName + \"\\nmessage_ts: \" + $json.messageTs + \"\\nmessage_text: \" + $json.messageText}}"
+            }
+          ]
+        },
+        "simplify": true,
+        "jsonOutput": true,
+        "options": {
+          "systemMessage": "You extract structured attendance records from Vietnamese Zalo messages. Always return one compact valid JSON object only.",
+          "temperature": 0,
+          "maxOutputTokens": 1800,
+          "topP": 0.8,
+          "topK": 10
+        }
+      },
+      "id": "e37e3069-e869-4fe2-a414-a4aa2cb53bd4",
+      "name": "Google Gemini",
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1,
+      "position": [
+        860,
+        320
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "nAgWqub1HztVDWc9",
+          "name": "Google Gemini API Local"
+        }
+      },
+      "notes": "Gemini chi trich xuat nghiep vu cham cong trong giai doan nay.",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const normalizeText = (value) => String(value ?? '').trim();\nconst normalizeNumber = (value) => {\n  const num = Number(value ?? 0);\n  return Number.isFinite(num) ? num : 0;\n};\nconst normalizeDate = (value) => {\n  const text = normalizeText(value);\n  return /^\\d{4}-\\d{2}-\\d{2}$/.test(text) ? text : '';\n};\nconst normalizeTime = (value) => {\n  const text = normalizeText(value);\n  return /^\\d{2}:\\d{2}$/.test(text) ? text : '';\n};\nconst asArray = (value) => Array.isArray(value) ? value : [];\n\nconst out = [];\nfor (const item of items) {\n  const finishReason = item.json?.finishReason ?? '';\n  const parts = item.json?.content?.parts ?? [];\n  const textPart = parts.find((part) => typeof part?.text === 'string')?.text ?? '';\n\n  let clean = textPart\n    .replace(/^```json\\s*/i, '')\n    .replace(/^```/i, '')\n    .replace(/```$/i, '')\n    .trim();\n\n  const firstBrace = clean.indexOf('{');\n  const lastBrace = clean.lastIndexOf('}');\n  if (firstBrace !== -1 && lastBrace > firstBrace) {\n    clean = clean.slice(firstBrace, lastBrace + 1);\n  }\n\n  let data;\n  try {\n    data = JSON.parse(clean);\n  } catch (error) {\n    throw new Error(`Gemini did not return valid JSON. Finish reason: ${finishReason}. Raw output: ${clean}`);\n  }\n\n  const attendanceEntries = asArray(data.attendance_entries).map((entry) => ({\n    employee_name: normalizeText(entry?.employee_name),\n    work_date: normalizeDate(entry?.work_date),\n    shift: normalizeText(entry?.shift),\n    start_time: normalizeTime(entry?.start_time),\n    end_time: normalizeTime(entry?.end_time),\n    hours: normalizeNumber(entry?.hours),\n    overtime_hours: normalizeNumber(entry?.overtime_hours),\n    site: normalizeText(entry?.site),\n    task: normalizeText(entry?.task),\n    status: normalizeText(entry?.status),\n    note: normalizeText(entry?.note),\n  })).filter((entry) => entry.employee_name || entry.work_date || entry.site || entry.task || entry.hours || entry.overtime_hours);\n\n  const documentType = normalizeText(data.document_type) || 'other';\n  if (documentType !== 'attendance' && attendanceEntries.length === 0) {\n    continue;\n  }\n\n  const notes = asArray(data.notes).map((note) => normalizeText(note)).filter(Boolean);\n  const tsNumber = Number(data.message_ts || Date.now());\n  const receivedAt = Number.isFinite(tsNumber)\n    ? new Date(tsNumber).toISOString()\n    : new Date().toISOString();\n\n  out.push({\n    json: {\n      received_at: receivedAt,\n      finish_reason: normalizeText(finishReason),\n      thread_id: normalizeText(data.thread_id),\n      group_name: normalizeText(data.group_name),\n      sender_id: normalizeText(data.sender_id),\n      sender_name: normalizeText(data.sender_name),\n      message_text: normalizeText(data.message_text),\n      message_ts: normalizeText(data.message_ts),\n      summary: normalizeText(data.summary),\n      document_type: 'attendance',\n      confidence: normalizeNumber(data.confidence),\n      needs_human_review: Boolean(data.needs_human_review),\n      attendance_entries: attendanceEntries,\n      main_material_entries: [],\n      sub_material_entries: [],\n      attendance_count: attendanceEntries.length,\n      main_material_count: 0,\n      sub_material_count: 0,\n      notes,\n      appscript_action: {\n        mode: 'route_attendance',\n        targets: ['ChamCong'],\n      },\n      raw_ai_json: clean,\n    },\n  });\n}\nreturn out;"
+      },
+      "id": "9fca49d2-d9fb-4258-807a-3b503ad5daa6",
+      "name": "Parse Attendance JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1160,
+        320
+      ],
+      "notes": "Chi giu lai tin nhan lien quan cham cong. Tin nhan khong phai cham cong se bi bo qua."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://script.google.com/macros/s/AKfycbyO_JlQSSNMM6r0SshXUBO2KABOR8To9nsE4yBVx_GMdsf5yuqg2Q4uPsQA37xZCBI7/exec",
+        "authentication": "none",
+        "sendHeaders": true,
+        "specifyHeaders": "json",
+        "jsonHeaders": "={\"Content-Type\":\"application/json\"}",
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{$json}}",
+        "options": {}
+      },
+      "id": "33f54b7b-315f-4e88-b71a-e7a9ce51553e",
+      "name": "Send Attendance to Apps Script",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        1460,
+        320
+      ],
+      "notes": "Dang tro vao cung Web App URL. Can cap nhat Apps Script de nhan attendance_entries."
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Zalo Message Trigger": {
+      "main": [
+        [
+          {
+            "node": "Normalize Zalo Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Zalo Message": {
+      "main": [
+        [
+          {
+            "node": "Google Gemini",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini": {
+      "main": [
+        [
+          {
+            "node": "Parse Attendance JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Attendance JSON": {
+      "main": [
+        [
+          {
+            "node": "Send Attendance to Apps Script",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

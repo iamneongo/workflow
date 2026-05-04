@@ -1,0 +1,179 @@
+{
+  "name": "Zalo Group -> Gemini -> Google Sheets",
+  "nodes": [
+    {
+      "parameters": {
+        "eventTypes": [
+          1
+        ],
+        "selfListen": false
+      },
+      "id": "f06bc479-0f58-4060-b335-0f708b6077f2",
+      "name": "Zalo Message Trigger",
+      "type": "n8n-nodes-zalo-tools.zaloMessageTrigger",
+      "typeVersion": 1,
+      "position": [
+        260,
+        300
+      ],
+      "notes": "Trigger nay lang nghe tin nhan moi trong nhom Zalo. Can chon credential zaloApi da tao sau khi dang nhap QR."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const out = [];\nfor (const item of items) {\n  const message = item.json?.message;\n  const text = message?.data?.content;\n  if (message?.isSelf) continue;\n  if (typeof text !== 'string' || !text.trim()) continue;\n\n  out.push({\n    json: {\n      threadId: message.threadId ?? '',\n      threadType: message.type ?? '',\n      groupName: message.data?.dName ?? '',\n      senderId: message.data?.uidFrom ?? '',\n      senderName: message.data?.dName ?? '',\n      messageText: text.trim(),\n      messageTs: message.data?.ts ?? '',\n      messageId: message.data?.msgId ?? '',\n      rawMessage: message,\n    },\n  });\n}\nreturn out;"
+      },
+      "id": "76df6980-f58d-4d34-9dd7-c97978de3c89",
+      "name": "Normalize Zalo Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        300
+      ],
+      "notes": "Node nay loc chi tin nhan text va dua ve schema gon gang de gui sang Gemini."
+    },
+    {
+      "parameters": {
+        "resource": "text",
+        "operation": "message",
+        "modelId": {
+          "mode": "id",
+          "value": "models/gemini-2.5-flash"
+        },
+        "messages": {
+          "values": [
+            {
+              "role": "user",
+              "content": "={{\"Analyze this Zalo group message and return ONLY valid JSON. Do not use markdown, do not add explanation.\\n\\nReturn exactly these keys: thread_id, group_name, sender_id, sender_name, message_text, message_ts, summary, category, intent, action_required, action_type, customer_name, phone, address, product, quantity, unit, amount, due_date, priority, confidence.\\n\\nRules:\\n- category must be one of: order, support, feedback, internal, other\\n- action_type must be one of: new_order, update_order, complaint, question, follow_up, other\\n- priority must be one of: low, medium, high\\n- action_required must be true or false\\n- quantity and amount must be numbers, use 0 if missing\\n- confidence must be a number from 0 to 1\\n- due_date must be ISO date if known, otherwise empty string\\n- Keep Vietnamese text natural in summary and intent\\n- Copy thread_id, group_name, sender_id, sender_name, message_text, message_ts from the input context exactly\\n\\nInput context:\\nthread_id: \" + $json.threadId + \"\\ngroup_name: \" + $json.groupName + \"\\nsender_id: \" + $json.senderId + \"\\nsender_name: \" + $json.senderName + \"\\nmessage_ts: \" + $json.messageTs + \"\\nmessage_text: \" + $json.messageText}}"
+            }
+          ]
+        },
+        "simplify": true,
+        "jsonOutput": true,
+        "options": {
+          "systemMessage": "You are a strict data extraction engine for Vietnamese Zalo group messages. Your job is to convert unstructured chat into structured JSON for Google Sheets.",
+          "temperature": 0.1,
+          "maxOutputTokens": 800,
+          "topP": 0.9,
+          "topK": 20
+        }
+      },
+      "id": "3d43d11c-ea55-4f0d-b59f-c56949594826",
+      "name": "Google Gemini",
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1,
+      "position": [
+        860,
+        300
+      ],
+      "notes": "Gan credential googlePalmApi cho node nay va paste Gemini API key."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const out = [];\nfor (const item of items) {\n  const parts = item.json?.content?.parts ?? [];\n  const textPart = parts.find((part) => typeof part?.text === 'string')?.text ?? '';\n  const clean = textPart\n    .replace(/^```json\\s*/i, '')\n    .replace(/^```/i, '')\n    .replace(/```$/i, '')\n    .trim();\n\n  let data;\n  try {\n    data = JSON.parse(clean);\n  } catch (error) {\n    throw new Error(`Gemini did not return valid JSON: ${clean}`);\n  }\n\n  const tsNumber = Number(data.message_ts || Date.now());\n  const receivedAt = Number.isFinite(tsNumber)\n    ? new Date(tsNumber).toISOString()\n    : new Date().toISOString();\n\n  out.push({\n    json: {\n      received_at: receivedAt,\n      thread_id: data.thread_id ?? '',\n      group_name: data.group_name ?? '',\n      sender_id: data.sender_id ?? '',\n      sender_name: data.sender_name ?? '',\n      message_text: data.message_text ?? '',\n      message_ts: data.message_ts ?? '',\n      summary: data.summary ?? '',\n      category: data.category ?? 'other',\n      intent: data.intent ?? '',\n      action_required: data.action_required ?? false,\n      action_type: data.action_type ?? 'other',\n      customer_name: data.customer_name ?? '',\n      phone: data.phone ?? '',\n      address: data.address ?? '',\n      product: data.product ?? '',\n      quantity: Number(data.quantity ?? 0),\n      unit: data.unit ?? '',\n      amount: Number(data.amount ?? 0),\n      due_date: data.due_date ?? '',\n      priority: data.priority ?? 'medium',\n      confidence: Number(data.confidence ?? 0),\n      raw_ai_json: clean,\n    },\n  });\n}\nreturn out;"
+      },
+      "id": "33c3090e-3f86-439e-b8b2-173a151f2697",
+      "name": "Parse Gemini JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1160,
+        300
+      ],
+      "notes": "Node nay parse JSON tu Gemini va flatten thanh cac cot de ghi vao Google Sheets."
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "mode": "id",
+          "value": "YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "mode": "name",
+          "value": "Sheet1"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": null
+        },
+        "options": {
+          "locationDefine": {
+            "values": {
+              "headerRow": 1
+            }
+          },
+          "useAppend": true
+        }
+      },
+      "id": "ae286c13-c683-40b0-821c-1dcb0d6baa66",
+      "name": "Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        1460,
+        300
+      ],
+      "notes": "Doi YOUR_GOOGLE_SHEET_ID thanh ID file Sheet cua ban, sau do gan credential Google Sheets OAuth2."
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Zalo Message Trigger": {
+      "main": [
+        [
+          {
+            "node": "Normalize Zalo Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Zalo Message": {
+      "main": [
+        [
+          {
+            "node": "Google Gemini",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini": {
+      "main": [
+        [
+          {
+            "node": "Parse Gemini JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Gemini JSON": {
+      "main": [
+        [
+          {
+            "node": "Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {},
+  "versionId": "7d59bc12-0660-48a1-95ca-0a871054b3f9",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

@@ -1,0 +1,140 @@
+{
+  "name": "Zalo -> Attendance Queue Listener",
+  "nodes": [
+    {
+      "parameters": {
+        "eventTypes": [
+          1
+        ],
+        "selfListen": false
+      },
+      "id": "dfb29f52-468d-4f98-bd6c-e4e31fef5dbe",
+      "name": "Zalo Message Trigger",
+      "type": "n8n-nodes-zalo-tools.zaloMessageTrigger",
+      "typeVersion": 1,
+      "position": [
+        260,
+        320
+      ],
+      "credentials": {
+        "zaloApi": {
+          "id": "ZiSsMyUEkndy1TDP",
+          "name": "Zalo API Credentials"
+        }
+      },
+      "notes": "Luon lang nghe tin nhan text moi tu Zalo va dua vao queue truoc khi goi AI."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const out = [];\nfor (const item of items) {\n  const message = item.json?.message;\n  const text = message?.data?.content;\n  if (message?.isSelf) continue;\n  if (typeof text !== 'string' || !text.trim()) continue;\n\n  const threadId = String(message.threadId ?? '');\n  const messageId = String(message.data?.msgId ?? '');\n  const messageTs = String(message.data?.ts ?? '');\n  const queueKey = [threadId, messageId || messageTs].filter(Boolean).join(':');\n\n  out.push({\n    json: {\n      queue_key: queueKey || `${threadId}:${Date.now()}`,\n      thread_id: threadId,\n      group_name: String(message.data?.dName ?? ''),\n      sender_id: String(message.data?.uidFrom ?? ''),\n      sender_name: String(message.data?.displayName ?? message.data?.dName ?? ''),\n      message_text: text.trim(),\n      message_ts: messageTs,\n      raw_message_json: JSON.stringify(message),\n      status: 'pending',\n      retry_count: 0,\n      last_error: '',\n      processed_at: null,\n      summary: '',\n      attendance_json: '',\n      needs_human_review: false,\n      confidence: 0,\n      appscript_response: '',\n    },\n  });\n}\nreturn out;"
+      },
+      "id": "6aa8f4b4-0dbf-4bf3-90fd-d30a23f6a7fe",
+      "name": "Prepare Queue Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        320
+      ],
+      "notes": "Chuan hoa payload va gan status pending de khong mat tin nhan khi AI loi."
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "rowNotExists",
+        "dataTableId": {
+          "mode": "id",
+          "value": "dad3ca9f-2474-4abc-bbf8-51e85f81eafa"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "queue_key",
+              "condition": "eq",
+              "keyValue": "={{$json.queue_key}}"
+            }
+          ]
+        }
+      },
+      "id": "6e30b8c0-47fe-4bb0-b864-bcfb88bad9a7",
+      "name": "Skip Duplicate Queue Items",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        860,
+        320
+      ],
+      "notes": "Neu webhook/gui lai cung mot message thi bo qua, tranh nhan doi queue."
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "mode": "id",
+          "value": "dad3ca9f-2474-4abc-bbf8-51e85f81eafa"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": null
+        },
+        "options": {}
+      },
+      "id": "3d21fe10-cdf2-45eb-b649-bdb79d1f3ba4",
+      "name": "Insert Queue Row",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1,
+      "position": [
+        1160,
+        320
+      ],
+      "notes": "Chi ghi vao queue. Khong goi AI o workflow listener de trigger luon on dinh."
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Zalo Message Trigger": {
+      "main": [
+        [
+          {
+            "node": "Prepare Queue Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Queue Row": {
+      "main": [
+        [
+          {
+            "node": "Skip Duplicate Queue Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip Duplicate Queue Items": {
+      "main": [
+        [
+          {
+            "node": "Insert Queue Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}
