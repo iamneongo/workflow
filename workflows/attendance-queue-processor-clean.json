@@ -1,5 +1,5 @@
 {
-  "name": "Attendance Queue -> AI -> Apps Script",
+  "name": "Attendance Queue Processor Clean",
   "nodes": [
     {
       "parameters": {
@@ -19,8 +19,7 @@
       "position": [
         260,
         320
-      ],
-      "notes": "Moi 5 phut quet queue pending va xu ly lai cac tin nhan chua xong."
+      ]
     },
     {
       "parameters": {
@@ -50,8 +49,7 @@
       "position": [
         560,
         320
-      ],
-      "notes": "Chi lay cac ban ghi con pending. Neu mot lan xu ly loi, record van o day de lan sau nhat lai."
+      ]
     },
     {
       "parameters": {
@@ -66,8 +64,7 @@
       "position": [
         860,
         320
-      ],
-      "notes": "Dua du lieu trong queue ve lai schema de prompt AI doc on dinh."
+      ]
     },
     {
       "parameters": {
@@ -82,50 +79,7 @@
       "position": [
         1160,
         320
-      ],
-      "notes": "Tang retry_count truoc khi goi AI. Neu run nay loi, queue van ghi nhan so lan da thu."
-    },
-    {
-      "parameters": {
-        "resource": "row",
-        "operation": "update",
-        "dataTableId": {
-          "mode": "id",
-          "value": "dad3ca9f-2474-4abc-bbf8-51e85f81eafa"
-        },
-        "matchType": "allConditions",
-        "filters": {
-          "conditions": [
-            {
-              "keyName": "thread_id",
-              "condition": "eq",
-              "keyValue": "={{String($json.thread_id)}}"
-            },
-            {
-              "keyName": "message_ts",
-              "condition": "eq",
-              "keyValue": "={{String($json.message_ts)}}"
-            }
-          ]
-        },
-        "columns": {
-          "mappingMode": "defineBelow",
-          "value": {
-            "retry_count": "={{Number($json.retry_count ?? 0)}}",
-            "last_error": "={{String($json.last_error ?? '')}}"
-          }
-        },
-        "options": {}
-      },
-      "id": "47db3b6b-201a-4b86-9fb6-72a78350d591",
-      "name": "Save Attempt Count",
-      "type": "n8n-nodes-base.dataTable",
-      "typeVersion": 1,
-      "position": [
-        1460,
-        320
-      ],
-      "notes": "Luu retry_count ngay ca khi AI/Apps Script that bai sau do."
+      ]
     },
     {
       "parameters": {
@@ -138,10 +92,9 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        1610,
+        1460,
         320
-      ],
-      "notes": "Sau khi update queue, tao lai cac field camelCase de prompt Gemini dung du lieu dung ten."
+      ]
     },
     {
       "parameters": {
@@ -156,8 +109,7 @@
       "position": [
         1760,
         320
-      ],
-      "notes": "Tu goi Gemini REST va xoay qua danh sach API keys khi gap 429/503 hoac rate limit."
+      ]
     },
     {
       "parameters": {
@@ -172,14 +124,13 @@
       "position": [
         2060,
         320
-      ],
-      "notes": "Neu AI ket luan khong phai cham cong, record se duoc danh dau ignored/needs_review thay vi retry mai."
+      ]
     },
     {
       "parameters": {
         "mode": "runOnceForEachItem",
         "language": "javaScript",
-        "jsCode": "const pickQueueFields = (input, overrides = {}) => ({\n  id: input.id,\n  queue_key: String(input.queue_key ?? ''),\n  thread_id: String(input.thread_id ?? ''),\n  group_name: String(input.group_name ?? ''),\n  sender_id: String(input.sender_id ?? ''),\n  sender_name: String(input.sender_name ?? ''),\n  message_text: String(input.message_text ?? ''),\n  message_ts: String(input.message_ts ?? ''),\n  raw_message_json: String(input.raw_message_json ?? ''),\n  status: String(input.status ?? 'pending'),\n  retry_count: Number(input.retry_count ?? 0),\n  last_error: String(input.last_error ?? ''),\n  processed_at: input.processed_at ?? null,\n  summary: String(input.summary ?? ''),\n  attendance_json: String(input.attendance_json ?? ''),\n  needs_human_review: Boolean(input.needs_human_review),\n  confidence: Number(input.confidence ?? 0),\n  appscript_response: String(input.appscript_response ?? ''),\n  ...overrides,\n});\n\nif ($json.document_type !== 'attendance' || !Array.isArray($json.attendance_entries) || $json.attendance_entries.length === 0) {\n  return {\n    json: pickQueueFields($json, {\n      appscript_response: JSON.stringify({ skipped: true, reason: 'non-attendance-or-empty' }),\n    }),\n  };\n}\n\nconst url = 'https://script.google.com/macros/s/AKfycbyzC-qw38puhlm5btycJs6ohYXArbRWBF7j70o0zU4MeHCWaoKjXM4BN4XXZXveHsgD/exec';\nconst response = await helpers.httpRequest({\n  method: 'POST',\n  url,\n  headers: {\n    'Content-Type': 'application/json',\n  },\n  body: $json,\n  json: false,\n});\n\nconst responseText = typeof response === 'string' ? response : JSON.stringify(response);\nconst responseLower = responseText.toLowerCase();\n\nif (\n  responseLower.includes('<!doctype html>') ||\n  responseLower.includes('không tìm thấy hàm tập lệnh: dopost') ||\n  responseLower.includes('khong tim thay ham tap lenh: dopost')\n) {\n  throw new Error(`Apps Script deployment is invalid or missing doPost. Response: ${responseText}`);\n}\n\nlet parsed;\ntry {\n  parsed = JSON.parse(responseText);\n} catch (error) {\n  throw new Error(`Apps Script did not return valid JSON. Response: ${responseText}`);\n}\n\nif (!parsed?.ok) {\n  throw new Error(`Apps Script returned ok=false. Response: ${responseText}`);\n}\n\nreturn {\n  json: pickQueueFields($json, {\n    appscript_response: responseText,\n  }),\n};"
+        "jsCode": "const pickQueueFields = (input, overrides = {}) => ({\n  id: input.id,\n  queue_key: String(input.queue_key ?? ''),\n  thread_id: String(input.thread_id ?? ''),\n  group_name: String(input.group_name ?? ''),\n  sender_id: String(input.sender_id ?? ''),\n  sender_name: String(input.sender_name ?? ''),\n  message_text: String(input.message_text ?? ''),\n  message_ts: String(input.message_ts ?? ''),\n  raw_message_json: String(input.raw_message_json ?? ''),\n  status: String(input.status ?? 'pending'),\n  retry_count: Number(input.retry_count ?? 0),\n  last_error: String(input.last_error ?? ''),\n  processed_at: input.processed_at ?? null,\n  summary: String(input.summary ?? ''),\n  attendance_json: String(input.attendance_json ?? ''),\n  needs_human_review: Boolean(input.needs_human_review),\n  confidence: Number(input.confidence ?? 0),\n  appscript_response: String(input.appscript_response ?? ''),\n  ...overrides,\n});\n\nif ($json.document_type !== 'attendance' || !Array.isArray($json.attendance_entries) || $json.attendance_entries.length === 0) {\n  return { json: pickQueueFields($json, { appscript_response: JSON.stringify({ skipped: true, reason: 'non-attendance-or-empty' }) }) };\n}\n\nconst url = 'https://script.google.com/macros/s/AKfycbyzC-qw38puhlm5btycJs6ohYXArbRWBF7j70o0zU4MeHCWaoKjXM4BN4XXZXveHsgD/exec';\nconst response = await helpers.httpRequest({ method: 'POST', url, headers: { 'Content-Type': 'application/json' }, body: $json, json: false });\nconst responseText = typeof response === 'string' ? response : JSON.stringify(response);\nconst responseLower = responseText.toLowerCase();\nif (responseLower.includes('<!doctype html>') || responseLower.includes('không tìm thấy hàm tập lệnh: dopost') || responseLower.includes('khong tim thay ham tap lenh: dopost')) throw new Error(`Apps Script deployment is invalid or missing doPost. Response: ${responseText}`);\nlet parsed;\ntry { parsed = JSON.parse(responseText); } catch (error) { throw new Error(`Apps Script did not return valid JSON. Response: ${responseText}`); }\nif (!parsed?.ok) throw new Error(`Apps Script returned ok=false. Response: ${responseText}`);\nreturn { json: pickQueueFields($json, { appscript_response: responseText }) };"
       },
       "id": "92b43201-6b2f-40a9-ad53-bf70c58ded0f",
       "name": "Send Attendance to Apps Script",
@@ -188,8 +139,7 @@
       "position": [
         2360,
         320
-      ],
-      "notes": "Chi gui Apps Script khi AI da parse ra cham cong. Neu web app loi hoac tra HTML/doPost missing thi workflow se fail that su."
+      ]
     },
     {
       "parameters": {
@@ -237,8 +187,7 @@
       "position": [
         2660,
         320
-      ],
-      "notes": "Chi danh dau done/ignored/needs_review sau khi toan bo buoc can thiet da xong."
+      ]
     }
   ],
   "pinData": {},
@@ -277,17 +226,6 @@
       ]
     },
     "Increment Retry Counter": {
-      "main": [
-        [
-          {
-            "node": "Save Attempt Count",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Save Attempt Count": {
       "main": [
         [
           {

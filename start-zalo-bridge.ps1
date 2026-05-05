@@ -1,9 +1,8 @@
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$userFolder = Join-Path $root '.n8n'
-$stdoutLog = Join-Path $root 'n8n.log'
-$stderrLog = Join-Path $root 'n8n-error.log'
+$scriptPath = Join-Path $root 'scripts\zalo-webhook-bridge.js'
+$stdoutLog = Join-Path $root 'zalo-bridge.log'
+$stderrLog = Join-Path $root 'zalo-bridge-error.log'
 $nodePath = 'C:\Program Files\nodejs\node.exe'
-$n8nBin = Join-Path $root 'node_modules\n8n\bin\n8n'
 
 function Get-DotenvAssignments {
   param([string]$Path)
@@ -42,17 +41,13 @@ function Get-DotenvAssignments {
   return $assignments
 }
 
-New-Item -ItemType Directory -Force -Path $userFolder | Out-Null
+$existing = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+  Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -like "*scripts\\zalo-webhook-bridge.js*" } |
+  Select-Object -First 1
 
-$listener = Get-NetTCPConnection -LocalPort 5678 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($listener) {
-  $owner = Get-CimInstance Win32_Process -Filter "ProcessId = $($listener.OwningProcess)" -ErrorAction SilentlyContinue
-  if ($owner -and $owner.CommandLine -like '*n8n*') {
-    Write-Output "n8n is already listening on http://127.0.0.1:5678 (PID $($listener.OwningProcess))."
-    exit 0
-  }
-
-  throw "Port 5678 is already in use by PID $($listener.OwningProcess)."
+if ($existing) {
+  Write-Output "Zalo bridge is already running (PID $($existing.ProcessId))."
+  exit 0
 }
 
 if (Test-Path $stdoutLog) { Remove-Item -LiteralPath $stdoutLog -Force }
@@ -64,16 +59,8 @@ $dotenvAssignments += Get-DotenvAssignments (Join-Path $root '.env.local')
 
 $envScript = @(
   $dotenvAssignments
-  "`$env:N8N_USER_FOLDER = '$userFolder'"
-  "`$env:N8N_HOST = '127.0.0.1'"
-  "`$env:N8N_PORT = '5678'"
-  "`$env:N8N_PROTOCOL = 'http'"
-  "`$env:DB_SQLITE_POOL_SIZE = '4'"
-  "`$env:N8N_RUNNERS_ENABLED = 'true'"
-  "`$env:N8N_BLOCK_ENV_ACCESS_IN_NODE = 'false'"
-  "`$env:N8N_GIT_NODE_DISABLE_BARE_REPOS = 'true'"
-  "`$env:N8N_DISABLE_ZALO_TRIGGER = 'true'"
-  "& '$nodePath' '$n8nBin' start"
+  "`$env:ZALO_BRIDGE_QUEUE_TABLE = if (`$env:ZALO_BRIDGE_QUEUE_TABLE) { `$env:ZALO_BRIDGE_QUEUE_TABLE } else { 'data_table_user_dad3ca9f-2474-4abc-bbf8-51e85f81eafa' }"
+  "& '$nodePath' '$scriptPath'"
 ) -join '; '
 
 $process = Start-Process `
@@ -85,4 +72,4 @@ $process = Start-Process `
   -RedirectStandardOutput $stdoutLog `
   -RedirectStandardError $stderrLog
 
-Write-Output "Started n8n on http://127.0.0.1:5678 (PID $($process.Id))."
+Write-Output "Started Zalo bridge (PID $($process.Id))."

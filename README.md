@@ -31,7 +31,7 @@ Repo nay dung de luu:
 
 1. Clone repo.
 2. Chay `npm install`.
-3. Chay `./start-n8n.ps1`.
+3. Chay `./start-attendance-stack.ps1`.
 4. Tao owner account tren local n8n neu la may moi.
 5. Tao lai credentials trong n8n:
    - `Zalo API Credentials`
@@ -41,11 +41,28 @@ Repo nay dung de luu:
 7. Copy code Apps Script `.gs` len Google Apps Script cua tung nguoi va deploy Web App URL rieng.
 8. Sua lai node URL/credential neu ten credential khac may goc.
 
+## Ban dang chay on dinh hien tai
+
+- `scripts/zalo-webhook-bridge.js`
+- `start-zalo-bridge.ps1`
+- `start-attendance-stack.ps1`
+- `workflows/attendance-queue-processor-clean.json`
+- `workflows/gia-phu-attendance-dopost-addon.gs`
+
+Kien truc hien tai:
+
+- `zca-js bridge` nghe tin nhan Zalo lien tuc
+- bridge ghi thang raw message vao queue SQLite
+- workflow `Attendance Queue Processor Clean` trong `n8n` quet queue moi phut
+- Gemini parse tin nhan cham cong
+- Apps Script ghi vao `Data_ChamCong`
+
 ## Workflow hien co
 
 - `workflows/zalo-ai-attendance-to-appscript.json`
 - `workflows/zalo-attendance-queue-listener.json`
 - `workflows/attendance-queue-to-ai-appscript.json`
+- `workflows/attendance-queue-processor-clean.json`
 - `workflows/zalo-ai-router-to-appscript.json`
 
 ## Cach cap nhat workflow len GitHub
