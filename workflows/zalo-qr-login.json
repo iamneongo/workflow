@@ -14,11 +14,11 @@
     },
     {
       "parameters": {
-        "qrPath": "D:\\Coding\\Server\\n8n-local-stable\\workflows\\zalo-qr.png"
+        "qrPath": "C:\\CongViec\\Shopee\\workflow\\workflows\\zalo-qr.png"
       },
       "id": "0dbfb1a0-54ca-476f-9cfa-b774f17936f2",
       "name": "Zalo Login Via QR",
-      "type": "n8n-nodes-zalo-tools.zaloLoginByQr",
+      "type": "CUSTOM.zaloLoginByQr",
       "typeVersion": 2,
       "position": [
         540,

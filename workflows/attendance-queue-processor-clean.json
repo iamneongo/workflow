@@ -100,16 +100,17 @@
       "parameters": {
         "mode": "runOnceForEachItem",
         "language": "javaScript",
-        "jsCode": "const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));\nconst keys = String($env.GEMINI_API_KEYS ?? '')\n  .split(/[\\n,;]+/)\n  .map((value) => value.trim())\n  .filter(Boolean);\n\nif (!keys.length) {\n  throw new Error('Missing GEMINI_API_KEYS. Add it to .env.local as a comma-separated list.');\n}\n\nconst model = String($env.GEMINI_MODEL ?? 'gemini-2.5-flash').trim() || 'gemini-2.5-flash';\nconst prompt = [\n  'Return exactly one compact JSON object. No markdown, no explanation, no code fence.',\n  'Classify the Vietnamese Zalo message as attendance or other.',\n  'Top-level keys in order: thread_id, group_name, sender_id, sender_name, message_text, message_ts, summary, document_type, confidence, needs_human_review, attendance_entries, notes.',\n  'attendance_entries item keys: employee_name, work_date, shift, start_time, end_time, hours, overtime_hours, site, task, status, note.',\n  'Use empty string for unknown text, 0 for unknown numbers, [] for arrays.',\n  'Use YYYY-MM-DD for dates and HH:mm for times when known.',\n  'Copy identity fields exactly from input.',\n  'If the message is attendance but ambiguous, extract what you can and set needs_human_review=true.',\n  '',\n  `thread_id: ${$json.threadId}`,\n  `group_name: ${$json.groupName}`,\n  `sender_id: ${$json.senderId}`,\n  `sender_name: ${$json.senderName}`,\n  `message_ts: ${$json.messageTs}`,\n  `message_text: ${$json.messageText}`,\n].join('\\n');\n\nconst requestBody = {\n  generationConfig: {\n    temperature: 0,\n    topP: 0.8,\n    topK: 10,\n    maxOutputTokens: 4096,\n    responseMimeType: 'application/json',\n    thinkingConfig: {\n      thinkingBudget: 0,\n    },\n  },\n  contents: [\n    {\n      role: 'user',\n      parts: [{ text: prompt }],\n    },\n  ],\n};\n\nconst baseUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;\nconst startIndex = Math.abs(Number($json.retry_count || 0)) % keys.length;\nlet lastError = null;\n\nfor (let offset = 0; offset < keys.length; offset += 1) {\n  const keyIndex = (startIndex + offset) % keys.length;\n  const apiKey = keys[keyIndex];\n\n  try {\n    const response = await helpers.httpRequest({\n      method: 'POST',\n      url: baseUrl,\n      headers: {\n        'Content-Type': 'application/json',\n        'x-goog-api-key': apiKey,\n      },\n      body: requestBody,\n      json: true,\n    });\n\n    const candidate = Array.isArray(response?.candidates) ? response.candidates[0] : null;\n    const content = candidate?.content ?? { parts: [] };\n    const finishReason = String(candidate?.finishReason ?? '');\n    const text = Array.isArray(content.parts)\n      ? content.parts.find((part) => typeof part?.text === 'string')?.text ?? ''\n      : '';\n\n    if (!text.trim()) {\n      throw new Error(`Gemini returned no text output with key #${keyIndex + 1}.`);\n    }\n\n    return {\n      json: {\n        ...$json,\n        content,\n        finishReason,\n        usageMetadata: response?.usageMetadata ?? null,\n        gemini_model: model,\n        gemini_key_index: keyIndex + 1,\n      },\n    };\n  } catch (error) {\n    const statusCode = Number(error?.response?.statusCode ?? error?.statusCode ?? 0);\n    const bodyText = typeof error?.response?.body === 'string'\n      ? error.response.body\n      : JSON.stringify(error?.response?.body ?? {});\n    const message = String(error?.message ?? 'Unknown Gemini error');\n    const combinedText = `${message} ${bodyText}`.toLowerCase();\n    const retryable = statusCode === 429 || statusCode === 503 || combinedText.includes('too many requests') || combinedText.includes('rate limit') || combinedText.includes('resource has been exhausted') || combinedText.includes('quota');\n\n    lastError = `key #${keyIndex + 1} failed (${statusCode || 'no-status'}): ${message}`;\n\n    if (!retryable || offset === keys.length - 1) {\n      break;\n    }\n\n    await sleep(1500 * (offset + 1));\n  }\n}\n\nthrow new Error(`All Gemini API keys failed. ${lastError ?? 'No detailed error available.'}`);"
+        "jsCode": "const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));\n\nconst baseUrl = String($env.NINEROUTER_BASE_URL ?? 'http://127.0.0.1:20128/api/v1/api/chat').trim().replace(/\\/$/, '');\nconst model = String($env.NINEROUTER_MODEL ?? $env.AI_MODEL ?? 'gemini/gemini-2.5-flash').trim() || 'gemini/gemini-2.5-flash';\nconst apiKey = String($env.NINEROUTER_API_KEY ?? $env.AI_API_KEY ?? '').trim();\nconst maxAttempts = Math.max(1, Number($env.NINEROUTER_MAX_ATTEMPTS ?? 3));\n\nconst prompt = [\n  'Return exactly one compact JSON object. No markdown, no explanation, no code fence.',\n  'Classify the Vietnamese Zalo message as attendance or other.',\n  'Top-level keys in order: thread_id, group_name, sender_id, sender_name, message_text, message_ts, summary, document_type, confidence, needs_human_review, attendance_entries, notes.',\n  'attendance_entries item keys: employee_name, work_date, shift, start_time, end_time, hours, overtime_hours, site, task, status, note.',\n  'Use empty string for unknown text, 0 for unknown numbers, [] for arrays.',\n  'Use YYYY-MM-DD for dates and HH:mm for times when known.',\n  'Copy identity fields exactly from input.',\n  'If the message is attendance but ambiguous, extract what you can and set needs_human_review=true.',\n  '',\n  `thread_id: ${$json.threadId}`,\n  `group_name: ${$json.groupName}`,\n  `sender_id: ${$json.senderId}`,\n  `sender_name: ${$json.senderName}`,\n  `message_ts: ${$json.messageTs}`,\n  `message_text: ${$json.messageText}`,\n].join('\\n');\n\nconst parseRouterText = (response) => {\n  if (typeof response === 'object' && response !== null) {\n    return String(response?.message?.content ?? response?.choices?.[0]?.message?.content ?? response?.content ?? '');\n  }\n\n  const raw = String(response ?? '');\n  let combined = '';\n  for (const line of raw.split(/\\r?\\n/)) {\n    const trimmed = line.trim();\n    if (!trimmed || trimmed === 'data: [DONE]' || trimmed === '[DONE]') continue;\n    const jsonText = trimmed.startsWith('data:') ? trimmed.slice(5).trim() : trimmed;\n    try {\n      const chunk = JSON.parse(jsonText);\n      combined += String(chunk?.message?.content ?? chunk?.choices?.[0]?.delta?.content ?? chunk?.choices?.[0]?.message?.content ?? '');\n    } catch {}\n  }\n  return combined || raw;\n};\n\nlet lastError = null;\nfor (let attempt = 1; attempt <= maxAttempts; attempt += 1) {\n  try {\n    const headers = { 'Content-Type': 'application/json' };\n    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;\n\n    const response = await helpers.httpRequest({\n      method: 'POST',\n      url: baseUrl,\n      headers,\n      body: {\n        model,\n        messages: [{ role: 'user', content: prompt }],\n        temperature: 0,\n        stream: false,\n        max_tokens: 4096,\n      },\n      json: false,\n    });\n\n    const text = parseRouterText(response).trim();\n    if (!text) throw new Error('9router returned no text output.');\n\n    return {\n      json: {\n        ...$json,\n        content: { parts: [{ text }] },\n        finishReason: 'STOP',\n        usageMetadata: null,\n        ai_provider: '9router',\n        ai_model: model,\n      },\n    };\n  } catch (error) {\n    const statusCode = Number(error?.response?.statusCode ?? error?.statusCode ?? 0);\n    const message = String(error?.message ?? 'Unknown 9router error');\n    lastError = `attempt ${attempt} failed (${statusCode || 'no-status'}): ${message}`;\n    if (attempt >= maxAttempts) break;\n    await sleep(1500 * attempt);\n  }\n}\n\nthrow new Error(`All 9router attempts failed. ${lastError ?? 'No detailed error available.'}`);"
       },
       "id": "e14e9ab1-a801-48d8-b27b-fd4977a896e7",
-      "name": "Google Gemini",
+      "name": "9router AI",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
         1760,
         320
-      ]
+      ],
+      "notes": "Goi AI qua 9router local, output giu dang Gemini content.parts de cac node sau khong can doi."
     },
     {
       "parameters": {
@@ -190,7 +191,6 @@
       ]
     }
   ],
-  "pinData": {},
   "connections": {
     "Schedule Trigger": {
       "main": [
@@ -240,18 +240,7 @@
       "main": [
         [
           {
-            "node": "Google Gemini",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Google Gemini": {
-      "main": [
-        [
-          {
-            "node": "Parse Attendance JSON",
+            "node": "9router AI",
             "type": "main",
             "index": 0
           }
@@ -274,6 +263,17 @@
         [
           {
             "node": "Mark Queue Row Complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "9router AI": {
+      "main": [
+        [
+          {
+            "node": "Parse Attendance JSON",
             "type": "main",
             "index": 0
           }
