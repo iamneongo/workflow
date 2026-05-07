@@ -186,7 +186,7 @@ function getRecentThreadHistory(threadId, limit = 8) {
 function getLatestClarificationContext(threadId) {
   if (!cleanText(threadId)) return Promise.resolve(null);
   const sql = `
-    select id, summary, attendance_json, zalo_reply_text, processed_at
+    select id, summary, attendance_json, appscript_response, zalo_reply_text, processed_at
     from "${QUEUE_TABLE}"
     where thread_id = ?
       and coalesce(zalo_reply_text, '') != ''
@@ -215,11 +215,22 @@ function getLatestClarificationContext(threadId) {
         draftEntries = [];
       }
 
+      const parsedResponse = parseJsonSafe(found.appscript_response, {});
+      const validation = parsedResponse?.validation || {};
+      const conflicts = Array.isArray(parsedResponse?.conflicts)
+        ? parsedResponse.conflicts
+        : (Array.isArray(validation?.conflicts) ? validation.conflicts : []);
+
+      const actualMissingFields = getMissingFieldsFromDraft(draftEntries);
       resolve({
         question: cleanText(found.zalo_reply_text),
         summary: cleanText(found.summary),
         draft_entries: draftEntries,
-        missing_fields: [],
+        missing_fields: actualMissingFields.length
+          ? actualMissingFields
+          : inferMissingFieldsFromQuestion(cleanText(found.zalo_reply_text), found.appscript_response),
+        conflicts,
+        validation,
         notes: ['Hydrated from latest assistant clarification in queue history.'],
         asked_at: cleanText(found.processed_at),
       });
@@ -286,11 +297,52 @@ function summarizeEntries(entries) {
     .filter((entry) => entry.employee_name || entry.work_date || entry.site || entry.task);
 }
 
+function parseJsonSafe(value, fallback) {
+  try {
+    const parsed = JSON.parse(value);
+    return parsed ?? fallback;
+  } catch (_error) {
+    return fallback;
+  }
+}
+
+function dedupeTurns(turns) {
+  return (Array.isArray(turns) ? turns : []).filter((turn, index, list) => {
+    const key = `${cleanText(turn?.role)}::${cleanText(turn?.ts)}::${cleanText(turn?.text)}`;
+    return list.findIndex((candidate) => {
+      const candidateKey = `${cleanText(candidate?.role)}::${cleanText(candidate?.ts)}::${cleanText(candidate?.text)}`;
+      return candidateKey === key;
+    }) === index;
+  });
+}
+
+function isLikelyFollowupReply(messageText) {
+  const text = cleanText(messageText);
+  if (!text) return false;
+  if (looksLikeFullAttendanceMessage(text)) return false;
+  const lineCount = text.split(/\r?\n/).filter((line) => cleanText(line)).length;
+  return lineCount <= 2 && text.length <= 120;
+}
+
+function looksLikeFullAttendanceMessage(text) {
+  const source = cleanText(text);
+  if (!source) return false;
+  const hasProject = /^\s*(ct|công\s*trình)/im.test(source);
+  const hasDate = /(\d{4})-(\d{2})-(\d{2})|(\d{1,2})\/(\d{1,2})\/(\d{4})/.test(source);
+  const hasShift = /\b(buổi|ca)\b[\s.:_-]*(sáng|chiều|tối|đêm|ngày)/i.test(source);
+  const hasWorkerLine = /^\s*\d+[.)]\s*\S+/m.test(source);
+  return hasProject && hasDate && hasShift && hasWorkerLine;
+}
+
 function buildPrompt(payload, context = {}) {
   const recentTurns = Array.isArray(context.recentTurns) ? context.recentTurns : [];
   const pendingClarification = context.pendingClarification || null;
   const lastAnalysis = context.lastAnalysis || null;
   const existingAttendance = Array.isArray(context.existingAttendance) ? context.existingAttendance : [];
+  const followupReply = isLikelyFollowupReply(payload?.message_text);
+  const historyTurns = followupReply ? recentTurns.slice(-3) : recentTurns.slice(-6);
+  const relevantAttendance = followupReply ? existingAttendance.slice(0, 4) : existingAttendance.slice(0, 8);
+  const pendingDraftEntries = summarizeEntries(pendingClarification?.draft_entries).slice(0, 4);
   const instructions = [
     'You are a Vietnamese Zalo attendance context engine.',
     'Return one minified JSON object only.',
@@ -317,9 +369,10 @@ function buildPrompt(payload, context = {}) {
     `SENDER_ID=${cleanText(payload.sender_id)}`,
     `SENDER_NAME=${cleanText(payload.sender_name)}`,
     `MESSAGE_TS=${cleanText(payload.message_ts)}`,
+    `IS_FOLLOWUP_REPLY=${followupReply ? 'true' : 'false'}`,
     `PENDING_CLARIFICATION=${JSON.stringify({
       question: truncateText(pendingClarification?.question, 220),
-      draft_entries: summarizeEntries(pendingClarification?.draft_entries),
+      draft_entries: pendingDraftEntries,
       summary: truncateText(pendingClarification?.summary, 220),
       missing_fields: Array.isArray(pendingClarification?.missing_fields) ? pendingClarification.missing_fields : [],
       notes: Array.isArray(pendingClarification?.notes) ? pendingClarification.notes.map((note) => truncateText(note, 120)) : [],
@@ -330,7 +383,7 @@ function buildPrompt(payload, context = {}) {
       attendance_entries: summarizeEntries(lastAnalysis?.attendance_entries),
       notes: Array.isArray(lastAnalysis?.notes) ? lastAnalysis.notes.map((note) => truncateText(note, 120)) : [],
     })}`,
-    `EXISTING_ATTENDANCE_CONTEXT=${JSON.stringify(existingAttendance.map((item) => ({
+    `EXISTING_ATTENDANCE_CONTEXT=${JSON.stringify(relevantAttendance.map((item) => ({
       employee_name: truncateText(item.employee_name, 80),
       work_date: cleanText(item.work_date),
       shift: cleanText(item.shift),
@@ -339,7 +392,7 @@ function buildPrompt(payload, context = {}) {
       summary: truncateText(item.summary, 160),
       processed_at: cleanText(item.processed_at),
     })))}`,
-    `RECENT_THREAD_HISTORY=${JSON.stringify(recentTurns.slice(-6).map((turn) => ({
+    `RECENT_THREAD_HISTORY=${JSON.stringify(historyTurns.map((turn) => ({
       role: cleanText(turn?.role),
       text: truncateText(turn?.text, 220),
       ts: cleanText(turn?.ts),
@@ -393,6 +446,12 @@ function splitWorkerAndTask(rawValue) {
   return { workersPart, task };
 }
 
+function isLikelyTaskLabel(value) {
+  const text = stripVietnamese(value).toLowerCase();
+  if (!text) return false;
+  return /^(t(ang|ầng)|l(au|ầu)|san|khu|phong|p\.?|mat bang)\b/.test(text);
+}
+
 function parseWorkerEntries(messageText) {
   const lines = cleanText(messageText).split(/\r?\n/).map((line) => cleanText(line)).filter(Boolean);
   const entries = [];
@@ -408,6 +467,11 @@ function parseWorkerEntries(messageText) {
         .map((part) => cleanText(part.replace(/^[-•]+/, '')))
     );
 
+    if (!workers.length && task) {
+      entries.push({ employee_name: '', task });
+      continue;
+    }
+
     for (const worker of workers) {
       entries.push({ employee_name: worker, task });
     }
@@ -417,7 +481,81 @@ function parseWorkerEntries(messageText) {
 }
 
 function parseNamesFromMessage(messageText) {
-  return uniqueStrings(parseWorkerEntries(messageText).map((entry) => entry.employee_name));
+  const parsedNames = uniqueStrings(parseWorkerEntries(messageText).map((entry) => entry.employee_name));
+  if (parsedNames.length) return parsedNames;
+
+  const text = cleanText(messageText).replace(/[.]+$/g, '');
+  if (!text || text.includes('\n')) return [];
+  if (parseDateFromMessage(text) || parseShiftFromMessage(text)) return [];
+  if (/^\s*(ct|công\s*trình)/i.test(text)) return [];
+  if (isLikelyTaskLabel(text)) return [];
+  return [text];
+}
+
+function buildQuestionForMissingField(field, context = {}) {
+  const employee = cleanText(context.employee_name);
+  const shift = cleanText(context.shift);
+  const workDate = cleanText(context.work_date);
+  const site = cleanText(context.site);
+  const task = cleanText(context.task);
+  const employeeText = employee ? ` của ${employee}` : '';
+  const shiftText = shift ? ` buổi ${normalizeShiftLabel(shift).toLowerCase()}` : '';
+  const dateText = workDate ? ` ngày ${formatViDate(workDate)}` : '';
+  const siteText = site ? ` ở công trình ${normalizeProjectLabel(site)}` : '';
+  const taskText = task ? ` tại ${task}` : '';
+
+  if (field === 'work_date') return `Bạn cho mình xin ngày chấm công${shiftText}${employeeText}${siteText}${taskText} là ngày nào?`;
+  if (field === 'shift') return `Bạn cho mình xin ca hoặc buổi làm việc${employeeText}${dateText}${siteText}${taskText} nhé?`;
+  if (field === 'site') return `Bạn xác nhận giúp mình công trình${employeeText}${shiftText}${dateText}${taskText} nhé?`;
+  if (field === 'employee_name') return `Bạn xác nhận giúp mình đúng họ tên nhân sự${shiftText}${dateText}${siteText}${taskText} nhé?`;
+  if (field === 'task') return `Bạn xác nhận giúp mình hạng mục hoặc vị trí làm việc${employeeText}${shiftText}${dateText}${siteText} nhé?`;
+  return 'Bạn xác nhận thêm giúp mình thông tin còn thiếu để mình ghi chấm công đúng nhé?';
+}
+
+function buildPartialDraftAnalysis(payload) {
+  const messageText = cleanText(payload?.message_text);
+  if (!messageText || !/^\s*\d+[.)]/m.test(messageText)) return null;
+
+  const workDate = parseDateFromMessage(messageText);
+  const shift = parseShiftFromMessage(messageText);
+  const site = /^\s*(ct|công\s*trình)/im.test(messageText) ? parseSiteFromMessage(messageText) : '';
+  const rawEntries = parseWorkerEntries(messageText);
+  if (!rawEntries.length) return null;
+
+  const attendanceEntries = rawEntries.map((entry) => {
+    const taskOnlyWorker = !entry.task && isLikelyTaskLabel(entry.employee_name);
+    return {
+      employee_name: taskOnlyWorker ? '' : cleanText(entry.employee_name),
+      work_date: workDate,
+      shift,
+      site,
+      task: taskOnlyWorker ? cleanText(entry.employee_name) : cleanText(entry.task),
+      hours: shift === 'Cả ngày' ? 1 : (shift ? 0.5 : 0),
+      overtime_hours: 0,
+      status: 'draft',
+      note: '',
+    };
+  });
+
+  const firstEntry = attendanceEntries[0] || {};
+  let missingField = '';
+  if (attendanceEntries.some((entry) => !cleanText(entry.employee_name))) missingField = 'employee_name';
+  else if (!workDate) missingField = 'work_date';
+  else if (!shift) missingField = 'shift';
+  else if (!site) missingField = 'site';
+
+  if (!missingField) return null;
+
+  return normalizeAnalysisShape({
+    action: 'ask_clarification',
+    question: buildQuestionForMissingField(missingField, firstEntry),
+    summary: `Đã nhận được bản nháp chấm công nhưng còn thiếu ${missingField}.`,
+    document_type: 'attendance',
+    confidence: 0.9,
+    needs_human_review: true,
+    attendance_entries: attendanceEntries,
+    notes: ['Đã dùng partial-draft parser để thu thập thông tin còn thiếu theo ngữ cảnh hội thoại.'],
+  });
 }
 
 function buildFastPathAnalysis(payload) {
@@ -432,6 +570,7 @@ function buildFastPathAnalysis(payload) {
   const workerEntries = parseWorkerEntries(messageText);
 
   if (!site || !workerEntries.length) return null;
+  if (workerEntries.some((entry) => !cleanText(entry.employee_name))) return null;
   if (!shift) return null;
 
   if (!workDate) {
@@ -775,7 +914,7 @@ async function handleConversation(payload) {
 
   if (documentType !== 'attendance' || !attendanceEntries.length) {
     const question = cleanText(analysis.question);
-    return {
+    const result = {
       status: question ? 'needs_review' : 'ignored',
       processed_at: processedAt,
       summary: cleanText(analysis.summary),
@@ -785,11 +924,13 @@ async function handleConversation(payload) {
       appscript_response: JSON.stringify(question ? buildClarificationPayload(analysis) : { skipped: true, reason: 'non-attendance-or-empty' }),
       reply_text: question,
     };
+    updateThreadStateFromResult(payload?.thread_id, payload, result);
+    return result;
   }
 
   if (cleanText(analysis.action) === 'ask_clarification' || analysis.needs_human_review) {
     const question = cleanText(analysis.question) || 'Mình cần bạn xác nhận thêm một chút để ghi chấm công đúng nhé.';
-    return {
+    const result = {
       status: 'needs_review',
       processed_at: processedAt,
       summary: cleanText(analysis.summary),
@@ -799,6 +940,8 @@ async function handleConversation(payload) {
       appscript_response: JSON.stringify(buildClarificationPayload(analysis, { question })),
       reply_text: question,
     };
+    updateThreadStateFromResult(payload?.thread_id, payload, result);
+    return result;
   }
 
   const basePayload = {
@@ -815,7 +958,7 @@ async function handleConversation(payload) {
   const validation = await postAppsScriptJson(basePayload);
   if (validation.valid === false) {
     const question = cleanText(validation.clarification_question) || cleanText(analysis.question) || 'Mình thấy có dữ liệu cần xác nhận lại trước khi ghi sheet.';
-    return {
+    const result = {
       status: 'needs_review',
       processed_at: processedAt,
       summary: cleanText(analysis.summary),
@@ -833,6 +976,8 @@ async function handleConversation(payload) {
       })),
       reply_text: question,
     };
+    updateThreadStateFromResult(payload?.thread_id, payload, result);
+    return result;
   }
 
   const saved = await postAppsScriptJson({
@@ -847,7 +992,7 @@ async function handleConversation(payload) {
     validation_snapshot: validation,
   });
 
-  return {
+  const result = {
     status: 'done',
     processed_at: processedAt,
     summary: cleanText(analysis.summary),
@@ -857,6 +1002,8 @@ async function handleConversation(payload) {
     appscript_response: JSON.stringify(saved),
     reply_text: buildSavedReply(attendanceEntries, saved),
   };
+  updateThreadStateFromResult(payload?.thread_id, payload, result);
+  return result;
 }
 
 function truncateTurns(turns, limit = 16) {
@@ -875,10 +1022,7 @@ function updateThreadState(threadId, payload, analysis, recentHistory) {
     ...truncateTurns(previous.recent_turns, 12),
     ...recentHistory.filter((turn) => cleanText(turn?.text)),
     userTurn,
-  ].filter((turn, index, list) => {
-    const key = `${turn.role}::${turn.ts}::${turn.text}`;
-    return list.findIndex((candidate) => `${candidate.role}::${candidate.ts}::${candidate.text}` === key) === index;
-  });
+  ];
 
   let pendingClarification = null;
   if (cleanText(analysis?.action) === 'ask_clarification' && cleanText(analysis?.question)) {
@@ -908,9 +1052,266 @@ function updateThreadState(threadId, payload, analysis, recentHistory) {
   };
 
   setThreadState(threadId, {
-    recent_turns: truncateTurns(assistantTurn ? [...mergedTurns, assistantTurn] : mergedTurns, 18),
+    recent_turns: truncateTurns(dedupeTurns(assistantTurn ? [...mergedTurns, assistantTurn] : mergedTurns), 18),
     pending_clarification: pendingClarification,
     last_analysis: lastAnalysis,
+    updated_at: new Date().toISOString(),
+  });
+}
+
+function inferMissingFieldsFromQuestion(question, appscriptResponse) {
+  const fields = new Set(extractMissingFields({ question }));
+  const parsed = parseJsonSafe(appscriptResponse, {});
+  const validation = parsed?.validation || {};
+  const conflicts = Array.isArray(parsed?.conflicts)
+    ? parsed.conflicts
+    : (Array.isArray(validation?.conflicts) ? validation.conflicts : []);
+
+  for (const conflict of conflicts) {
+    const type = stripVietnamese(conflict?.type).toLowerCase();
+    if (type.includes('unknown_staff')) fields.add('employee_name');
+    if (type.includes('hang_muc') || type.includes('scope') || type.includes('task')) fields.add('task');
+    if (type.includes('date')) fields.add('work_date');
+    if (type.includes('shift')) fields.add('shift');
+    if (type.includes('site') || type.includes('cong_trinh')) fields.add('site');
+  }
+
+  return [...fields];
+}
+
+function normalizeComparable(value) {
+  return stripVietnamese(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9\s/.-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function selectSuggestionFromPending(messageText, pendingClarification) {
+  const comparableMessage = normalizeComparable(messageText);
+  const conflicts = Array.isArray(pendingClarification?.conflicts) ? pendingClarification.conflicts : [];
+  const suggestions = uniqueStrings(conflicts.flatMap((conflict) => (
+    Array.isArray(conflict?.suggestions) ? conflict.suggestions : []
+  )));
+  if (!suggestions.length || !comparableMessage) return '';
+
+  const exact = suggestions.find((suggestion) => normalizeComparable(suggestion) === comparableMessage);
+  if (exact) return exact;
+
+  const included = suggestions.find((suggestion) => comparableMessage.includes(normalizeComparable(suggestion)));
+  if (included) return included;
+
+  const messageTokens = comparableMessage.split(' ').filter(Boolean);
+  let best = '';
+  let bestScore = 0;
+  for (const suggestion of suggestions) {
+    const suggestionTokens = normalizeComparable(suggestion).split(' ').filter(Boolean);
+    const overlap = suggestionTokens.filter((token) => messageTokens.includes(token)).length;
+    if (overlap > bestScore) {
+      best = suggestion;
+      bestScore = overlap;
+    }
+  }
+  return bestScore > 0 ? best : '';
+}
+
+function nextMissingFieldFromDraft(entries) {
+  const list = normalizeAttendanceEntries(entries);
+  if (!list.length) return 'employee_name';
+  if (list.some((entry) => !cleanText(entry.employee_name))) return 'employee_name';
+  if (list.some((entry) => !cleanText(entry.work_date))) return 'work_date';
+  if (list.some((entry) => !cleanText(entry.shift))) return 'shift';
+  if (list.some((entry) => !cleanText(entry.site))) return 'site';
+  if (list.some((entry) => !cleanText(entry.task))) return 'task';
+  return '';
+}
+
+function getMissingFieldsFromDraft(entries) {
+  const list = normalizeAttendanceEntries(entries);
+  if (!list.length) return ['employee_name'];
+  const fields = [];
+  if (list.some((entry) => !cleanText(entry.employee_name))) fields.push('employee_name');
+  if (list.some((entry) => !cleanText(entry.work_date))) fields.push('work_date');
+  if (list.some((entry) => !cleanText(entry.shift))) fields.push('shift');
+  if (list.some((entry) => !cleanText(entry.site))) fields.push('site');
+  if (list.some((entry) => !cleanText(entry.task))) fields.push('task');
+  return fields;
+}
+
+function buildMissingFieldQuestion(field, draftEntries) {
+  const firstEntry = normalizeAttendanceEntries(draftEntries)[0] || {};
+  const employeeText = cleanText(firstEntry.employee_name) ? ` của ${firstEntry.employee_name}` : '';
+  const shiftText = cleanText(firstEntry.shift) ? ` buổi ${normalizeShiftLabel(firstEntry.shift).toLowerCase()}` : '';
+  const dateText = cleanText(firstEntry.work_date) ? ` ngày ${formatViDate(firstEntry.work_date)}` : '';
+  const siteText = cleanText(firstEntry.site) ? ` ở công trình ${normalizeProjectLabel(firstEntry.site)}` : '';
+
+  if (field === 'work_date') return `Bạn cho mình xin ngày chấm công${shiftText}${employeeText}${siteText} là ngày nào?`;
+  if (field === 'shift') return `Bạn cho mình xin ca hoặc buổi làm việc${employeeText}${dateText}${siteText} nhé?`;
+  if (field === 'task') return `Bạn xác nhận giúp mình hạng mục hoặc vị trí làm việc${employeeText}${shiftText}${dateText}${siteText} nhé?`;
+  if (field === 'site') return `Bạn xác nhận giúp mình công trình${employeeText}${shiftText}${dateText} nhé?`;
+  if (field === 'employee_name') return `Bạn xác nhận giúp mình đúng họ tên nhân sự${shiftText}${dateText}${siteText} nhé?`;
+  return 'Bạn xác nhận thêm giúp mình thông tin còn thiếu để mình ghi chấm công đúng nhé?';
+}
+
+function resolvePendingClarificationLocally(payload, pendingClarification) {
+  if (!pendingClarification || !cleanText(pendingClarification?.question)) return null;
+  const messageText = cleanText(payload?.message_text);
+  if (!isLikelyFollowupReply(messageText)) return null;
+
+  const draftEntries = normalizeAttendanceEntries(pendingClarification?.draft_entries);
+  if (!draftEntries.length) return null;
+
+  const missingFields = new Set(
+    Array.isArray(pendingClarification?.missing_fields) && pendingClarification.missing_fields.length
+      ? pendingClarification.missing_fields
+      : inferMissingFieldsFromQuestion(pendingClarification?.question, JSON.stringify({ conflicts: pendingClarification?.conflicts || [] }))
+  );
+
+  let changed = false;
+  const resolvedFields = [];
+  const workDate = parseDateFromMessage(messageText);
+  const shift = parseShiftFromMessage(messageText);
+  const site = parseSiteFromMessage(messageText);
+  const explicitNames = parseNamesFromMessage(messageText);
+  const suggestedTask = selectSuggestionFromPending(messageText, pendingClarification);
+  const cleanedReply = cleanText(messageText.replace(/^l(à|a)\s+/i, '').replace(/^đúng[,.\s]*/i, '').trim());
+
+  if (missingFields.has('work_date') && workDate) {
+    draftEntries.forEach((entry) => { entry.work_date = workDate; });
+    changed = true;
+    resolvedFields.push('work_date');
+  }
+
+  if (missingFields.has('shift') && shift) {
+    draftEntries.forEach((entry) => { entry.shift = shift; });
+    changed = true;
+    resolvedFields.push('shift');
+  }
+
+  if (missingFields.has('site') && site) {
+    draftEntries.forEach((entry) => { entry.site = site; });
+    changed = true;
+    resolvedFields.push('site');
+  }
+
+  if (missingFields.has('employee_name') && explicitNames.length) {
+    if (explicitNames.length === draftEntries.length) {
+      draftEntries.forEach((entry, index) => { entry.employee_name = explicitNames[index]; });
+      changed = true;
+      resolvedFields.push('employee_name');
+    } else if (explicitNames.length === 1 && draftEntries.length === 1) {
+      draftEntries[0].employee_name = explicitNames[0];
+      changed = true;
+      resolvedFields.push('employee_name');
+    }
+  }
+
+  if (missingFields.has('task')) {
+    const taskValue = suggestedTask || cleanedReply;
+    if (taskValue && !parseDateFromMessage(taskValue) && !parseShiftFromMessage(taskValue)) {
+      draftEntries.forEach((entry) => { entry.task = taskValue; });
+      changed = true;
+      resolvedFields.push('task');
+    }
+  }
+
+  if (!changed) return null;
+
+  const unresolvedField = nextMissingFieldFromDraft(draftEntries);
+  if (unresolvedField) {
+    return normalizeAnalysisShape({
+      action: 'ask_clarification',
+      question: buildMissingFieldQuestion(unresolvedField, draftEntries),
+      summary: `Đã hiểu thêm ${resolvedFields.join(', ')} từ câu trả lời follow-up nhưng vẫn còn thiếu ${unresolvedField}.`,
+      document_type: 'attendance',
+      confidence: 0.9,
+      needs_human_review: true,
+      attendance_entries: draftEntries,
+      notes: ['Đã hợp nhất câu trả lời follow-up vào pending clarification trước đó.'],
+    });
+  }
+
+  return normalizeAnalysisShape({
+    action: 'save_attendance',
+    question: '',
+    summary: `Đã hợp nhất câu trả lời follow-up vào bản nháp chấm công trước đó và đã đủ dữ liệu để ghi.`,
+    document_type: 'attendance',
+    confidence: 0.96,
+    needs_human_review: false,
+    attendance_entries: draftEntries,
+    notes: ['Đã hợp nhất câu trả lời follow-up vào pending clarification trước đó.'],
+  });
+}
+
+function updateThreadStateFromResult(threadId, payload, result) {
+  const cleanThreadId = cleanText(threadId);
+  if (!cleanThreadId) return;
+
+  const previous = getThreadState(cleanThreadId);
+  const userTurn = {
+    role: 'user',
+    text: cleanText(payload?.message_text),
+    ts: cleanText(payload?.message_ts) || new Date().toISOString(),
+  };
+
+  const assistantText = cleanText(result?.reply_text);
+  const assistantTurn = assistantText
+    ? {
+        role: 'assistant',
+        text: assistantText,
+        ts: cleanText(result?.processed_at) || new Date().toISOString(),
+      }
+    : null;
+
+  const attendanceEntries = summarizeEntries(parseJsonSafe(result?.attendance_json, []));
+  const appscriptResponse = cleanText(result?.appscript_response);
+  const parsedResponse = parseJsonSafe(appscriptResponse, {});
+  const validation = parsedResponse?.validation || {};
+  const conflicts = Array.isArray(parsedResponse?.conflicts)
+    ? parsedResponse.conflicts
+    : (Array.isArray(validation?.conflicts) ? validation.conflicts : []);
+  const notes = uniqueStrings([
+    ...((Array.isArray(parsedResponse?.notes) ? parsedResponse.notes : []).map(cleanText)),
+    cleanText(result?.summary),
+  ]).filter(Boolean);
+
+  let action = 'ignore';
+  if (cleanText(result?.status) === 'done') action = 'save_attendance';
+  else if (cleanText(result?.status) === 'needs_review') action = 'ask_clarification';
+
+  const pendingClarification = cleanText(result?.status) === 'needs_review' && assistantText
+    ? {
+        question: assistantText,
+        summary: cleanText(result?.summary),
+        draft_entries: attendanceEntries,
+        missing_fields: (() => {
+          const actualMissingFields = getMissingFieldsFromDraft(attendanceEntries);
+          return actualMissingFields.length
+            ? actualMissingFields
+            : inferMissingFieldsFromQuestion(assistantText, appscriptResponse);
+        })(),
+        notes,
+        conflicts,
+        validation,
+        asked_at: cleanText(result?.processed_at) || new Date().toISOString(),
+      }
+    : null;
+
+  const mergedTurns = dedupeTurns([
+    ...truncateTurns(previous.recent_turns, 14),
+    userTurn,
+    ...(assistantTurn ? [assistantTurn] : []),
+  ]);
+
+  setThreadState(cleanThreadId, {
+    recent_turns: truncateTurns(mergedTurns, 18),
+    pending_clarification: pendingClarification,
+    last_analysis: {
+      action,
+      summary: cleanText(result?.summary),
+      attendance_entries: attendanceEntries,
+      notes,
+    },
     updated_at: new Date().toISOString(),
   });
 }
@@ -954,6 +1355,21 @@ async function runOpenClaw(payload) {
     log(`Failed to hydrate clarification context for ${threadId}: ${error.message}`);
     return null;
   });
+  const localResolution = resolvePendingClarificationLocally(payload, hydratedClarification);
+  if (localResolution) {
+    return {
+      session_id: sessionId,
+      analysis: localResolution,
+      raw: {
+        meta: {
+          agentMeta: {
+            provider: 'clarification-resolver',
+            model: 'thread-state-merger',
+          },
+        },
+      },
+    };
+  }
   const candidateContext = inferCandidateContext(payload, hydratedClarification);
   const existingAttendance = await getExistingAttendanceContext(threadId, candidateContext).catch((error) => {
     log(`Failed to read existing attendance context for ${threadId}: ${error.message}`);
@@ -978,6 +1394,23 @@ async function runOpenClaw(payload) {
           agentMeta: {
             provider: 'fast-path',
             model: 'rule-parser',
+          },
+        },
+      },
+    };
+  }
+
+  const partialDraft = buildPartialDraftAnalysis(payload);
+  if (partialDraft) {
+    updateThreadState(threadId, payload, partialDraft, recentHistory);
+    return {
+      session_id: sessionId,
+      analysis: partialDraft,
+      raw: {
+        meta: {
+          agentMeta: {
+            provider: 'partial-draft',
+            model: 'thread-state-merger',
           },
         },
       },
