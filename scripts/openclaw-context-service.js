@@ -15,6 +15,9 @@ const ROOT = path.resolve(__dirname, '..');
 const DB_PATH = process.env.OPENCLAW_CONTEXT_DB_PATH || path.join(ROOT, '.n8n', '.n8n', 'database.sqlite');
 const QUEUE_TABLE =
   process.env.OPENCLAW_CONTEXT_QUEUE_TABLE || 'data_table_user_dad3ca9f-2474-4abc-bbf8-51e85f81eafa';
+const APPS_SCRIPT_URL =
+  process.env.APPS_SCRIPT_URL ||
+  'https://script.google.com/macros/s/AKfycbyzC-qw38puhlm5btycJs6ohYXArbRWBF7j70o0zU4MeHCWaoKjXM4BN4XXZXveHsgD/exec';
 const STATE_DIR = path.join(ROOT, '.runtime');
 const STATE_PATH = path.join(STATE_DIR, 'openclaw-thread-state.json');
 
@@ -632,6 +635,230 @@ function normalizeAnalysisShape(analysis) {
   return next;
 }
 
+function normalizeShiftLabel(value) {
+  const text = cleanText(value);
+  const lower = stripVietnamese(text).toLowerCase();
+  if (lower.includes('sang')) return 'Sáng';
+  if (lower.includes('chieu')) return 'Chiều';
+  if (lower.includes('toi')) return 'Tối';
+  if (lower.includes('dem')) return 'Đêm';
+  if (lower.includes('ngay')) return 'Ngày';
+  return text;
+}
+
+function formatViDate(value) {
+  const text = cleanText(value);
+  if (!text) return '';
+  const isoMatch = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (isoMatch) return `${isoMatch[3]}/${isoMatch[2]}/${isoMatch[1]}`;
+  const viMatch = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (viMatch) return `${viMatch[1].padStart(2, '0')}/${viMatch[2].padStart(2, '0')}/${viMatch[3]}`;
+  return text;
+}
+
+function humanizeLabel(value) {
+  const text = cleanText(value);
+  if (!text) return '';
+  return text.charAt(0).toLocaleUpperCase('vi-VN') + text.slice(1);
+}
+
+function normalizeProjectLabel(value) {
+  const text = cleanText(value);
+  if (!text) return '';
+  const withoutPrefix = text
+    .replace(/^c(t|ông\s*tr(ì|i)nh)\s*/i, '')
+    .replace(/^ct\s*/i, '')
+    .trim();
+  return humanizeLabel(withoutPrefix || text);
+}
+
+function joinVietnameseList(values) {
+  const list = [...new Set((Array.isArray(values) ? values : []).map(cleanText).filter(Boolean))];
+  if (list.length <= 1) return list[0] || '';
+  if (list.length === 2) return `${list[0]} và ${list[1]}`;
+  return `${list.slice(0, -1).join(', ')} và ${list[list.length - 1]}`;
+}
+
+async function postAppsScriptJson(body) {
+  const response = await fetch(APPS_SCRIPT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const responseText = await response.text();
+  let parsed;
+  try {
+    parsed = JSON.parse(responseText);
+  } catch (error) {
+    throw new Error(`Apps Script did not return valid JSON: ${error.message}`);
+  }
+  if (!parsed?.ok) {
+    throw new Error(parsed?.message || 'Apps Script returned ok=false');
+  }
+  return parsed;
+}
+
+function buildClarificationPayload(analysis, extra = {}) {
+  return {
+    mode: 'clarification_request',
+    source: extra.source || 'openclaw',
+    question: cleanText(analysis?.question) || cleanText(extra.question),
+    confidence: Number(analysis?.confidence ?? extra.confidence ?? 0),
+    ambiguity_flags: Array.isArray(extra.ambiguity_flags)
+      ? extra.ambiguity_flags
+      : Array.isArray(analysis?.ambiguity_flags)
+        ? analysis.ambiguity_flags
+        : [],
+    notes: [
+      ...((Array.isArray(analysis?.notes) ? analysis.notes : []).map(cleanText)),
+      ...((Array.isArray(extra.notes) ? extra.notes : []).map(cleanText)),
+    ].filter(Boolean),
+    ...(extra.validation ? { validation: extra.validation } : {}),
+    ...(Array.isArray(extra.conflicts) ? { conflicts: extra.conflicts } : {}),
+  };
+}
+
+function buildSavedReply(attendanceEntries, parsed) {
+  const names = joinVietnameseList(attendanceEntries.map((entry) => entry.employee_name));
+  const shifts = [...new Set(attendanceEntries.map((entry) => normalizeShiftLabel(entry.shift)).filter(Boolean))];
+  const dates = [...new Set(attendanceEntries.map((entry) => formatViDate(entry.work_date)).filter(Boolean))];
+  const tasks = [...new Set(attendanceEntries.map((entry) => cleanText(entry.task)).filter(Boolean))];
+  const projectNames = [...new Set(attendanceEntries.map((entry) => normalizeProjectLabel(entry.site)).filter(Boolean))];
+  const shiftText = shifts.length === 1 ? ` buổi ${shifts[0]}` : '';
+  const dateText = dates.length === 1 ? ` ngày ${dates[0]}` : '';
+  const taskText = tasks.length === 1 ? ` ở hạng mục ${tasks[0]}` : '';
+  const projectText = projectNames.length === 1 ? ` cho công trình ${projectNames[0]}` : '';
+  if (names) {
+    return `Đã chấm công${shiftText}${dateText} cho ${names}${taskText}${projectText}. Mình đã lưu vào app rồi nhé.`;
+  }
+  const count = Number(parsed?.counts?.attendance ?? 0);
+  return `Đã lưu chấm công thành công${count > 0 ? ` ${count} dòng` : ''}${projectText}. Mình đã cập nhật lên app rồi nhé.`;
+}
+
+function normalizeAttendanceEntries(entries) {
+  return (Array.isArray(entries) ? entries : []).map((entry) => ({
+    employee_name: cleanText(entry?.employee_name),
+    work_date: cleanText(entry?.work_date),
+    shift: cleanText(entry?.shift),
+    start_time: cleanText(entry?.start_time),
+    end_time: cleanText(entry?.end_time),
+    hours: Number(entry?.hours ?? 0),
+    overtime_hours: Number(entry?.overtime_hours ?? 0),
+    site: cleanText(entry?.site),
+    task: cleanText(entry?.task),
+    status: cleanText(entry?.status),
+    note: cleanText(entry?.note),
+  })).filter((entry) => entry.employee_name || entry.work_date || entry.site || entry.task);
+}
+
+async function handleConversation(payload) {
+  let analysis;
+  try {
+    const result = await runOpenClaw(payload);
+    analysis = normalizeAnalysisShape(result.analysis);
+  } catch (error) {
+    analysis = normalizeAnalysisShape({
+      action: 'ask_clarification',
+      question: 'Mình đang xử lý chậm ở bước hiểu ngữ cảnh. Bạn gửi lại giúp mình theo mẫu: Công trình + Ngày + Buổi + danh sách nhân sự nhé.',
+      summary: 'OpenClaw gặp lỗi hoặc timeout, đã chuyển sang hỏi lại để không chặn hàng đợi.',
+      document_type: 'attendance',
+      confidence: 0.2,
+      needs_human_review: true,
+      attendance_entries: [],
+      notes: [`OpenClaw unavailable: ${cleanText(error?.message || error)}`],
+    });
+  }
+
+  const attendanceEntries = normalizeAttendanceEntries(analysis.attendance_entries);
+  const documentType = cleanText(analysis.document_type) || (attendanceEntries.length ? 'attendance' : 'other');
+  const processedAt = new Date().toISOString();
+
+  if (documentType !== 'attendance' || !attendanceEntries.length) {
+    const question = cleanText(analysis.question);
+    return {
+      status: question ? 'needs_review' : 'ignored',
+      processed_at: processedAt,
+      summary: cleanText(analysis.summary),
+      attendance_json: JSON.stringify(attendanceEntries),
+      needs_human_review: Boolean(question || analysis.needs_human_review),
+      confidence: Number(analysis.confidence ?? 0),
+      appscript_response: JSON.stringify(question ? buildClarificationPayload(analysis) : { skipped: true, reason: 'non-attendance-or-empty' }),
+      reply_text: question,
+    };
+  }
+
+  if (cleanText(analysis.action) === 'ask_clarification' || analysis.needs_human_review) {
+    const question = cleanText(analysis.question) || 'Mình cần bạn xác nhận thêm một chút để ghi chấm công đúng nhé.';
+    return {
+      status: 'needs_review',
+      processed_at: processedAt,
+      summary: cleanText(analysis.summary),
+      attendance_json: JSON.stringify(attendanceEntries),
+      needs_human_review: true,
+      confidence: Number(analysis.confidence ?? 0),
+      appscript_response: JSON.stringify(buildClarificationPayload(analysis, { question })),
+      reply_text: question,
+    };
+  }
+
+  const basePayload = {
+    ...payload,
+    mode: 'validate_attendance',
+    document_type: 'attendance',
+    confidence: Number(analysis.confidence ?? 0),
+    needs_human_review: false,
+    attendance_entries: attendanceEntries,
+    summary: cleanText(analysis.summary),
+    notes: Array.isArray(analysis.notes) ? analysis.notes : [],
+  };
+
+  const validation = await postAppsScriptJson(basePayload);
+  if (validation.valid === false) {
+    const question = cleanText(validation.clarification_question) || cleanText(analysis.question) || 'Mình thấy có dữ liệu cần xác nhận lại trước khi ghi sheet.';
+    return {
+      status: 'needs_review',
+      processed_at: processedAt,
+      summary: cleanText(analysis.summary),
+      attendance_json: JSON.stringify(attendanceEntries),
+      needs_human_review: true,
+      confidence: Number(analysis.confidence ?? 0),
+      appscript_response: JSON.stringify(buildClarificationPayload(analysis, {
+        source: 'sheet_validation',
+        question,
+        validation,
+        conflicts: Array.isArray(validation.conflicts) ? validation.conflicts : [],
+        ambiguity_flags: Array.isArray(validation.conflicts)
+          ? validation.conflicts.map((conflict) => cleanText(conflict?.type)).filter(Boolean)
+          : [],
+      })),
+      reply_text: question,
+    };
+  }
+
+  const saved = await postAppsScriptJson({
+    ...payload,
+    mode: 'route_attendance',
+    document_type: 'attendance',
+    confidence: Number(analysis.confidence ?? 0),
+    needs_human_review: false,
+    attendance_entries: attendanceEntries,
+    summary: cleanText(analysis.summary),
+    notes: Array.isArray(analysis.notes) ? analysis.notes : [],
+    validation_snapshot: validation,
+  });
+
+  return {
+    status: 'done',
+    processed_at: processedAt,
+    summary: cleanText(analysis.summary),
+    attendance_json: JSON.stringify(attendanceEntries),
+    needs_human_review: false,
+    confidence: Number(analysis.confidence ?? 0),
+    appscript_response: JSON.stringify(saved),
+    reply_text: buildSavedReply(attendanceEntries, saved),
+  };
+}
+
 function truncateTurns(turns, limit = 16) {
   return (Array.isArray(turns) ? turns : []).slice(-limit);
 }
@@ -861,6 +1088,21 @@ const server = http.createServer(async (req, res) => {
         host: HOST,
         port: PORT,
         openclawBin: OPENCLAW_LAUNCH.display,
+      });
+      return;
+    }
+
+    if (req.method === 'POST' && req.url === '/handle') {
+      const payload = await readJsonBody(req);
+      const startedAt = Date.now();
+      const result = await handleConversation(payload);
+      writeJson(res, 200, {
+        ok: true,
+        result,
+        meta: {
+          duration_ms: Date.now() - startedAt,
+          provider: 'openclaw-first',
+        },
       });
       return;
     }

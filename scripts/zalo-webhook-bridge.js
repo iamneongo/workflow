@@ -194,11 +194,13 @@ function insertQueueRow(message) {
 					queueKey,
 					threadId,
 					messageId,
+					rowId: 0,
 					superseded: 0,
 				});
 				return;
 			}
 
+			const rowId = this.lastID;
 			supersedeOlderPendingRows(threadId, queueKey, text.trim())
 				.then((superseded) => {
 					resolve({
@@ -206,6 +208,7 @@ function insertQueueRow(message) {
 						queueKey,
 						threadId,
 						messageId,
+						rowId,
 						superseded,
 					});
 				})
@@ -589,6 +592,94 @@ function markZaloReplyFailed(rowId, error) {
 	});
 }
 
+function updateQueueRowAfterConversation(rowId, result) {
+	const sql = `
+		update "${QUEUE_TABLE}"
+		set status = ?,
+			processed_at = ?,
+			summary = ?,
+			attendance_json = ?,
+			needs_human_review = ?,
+			confidence = ?,
+			appscript_response = ?,
+			last_error = '',
+			updatedAt = ?
+		where id = ?
+	`;
+	const now = new Date().toISOString().replace('T', ' ').replace('Z', '');
+
+	return new Promise((resolve, reject) => {
+		const db = new sqlite3.Database(DB_PATH);
+		db.run(
+			sql,
+			[
+				String(result?.status ?? 'ignored'),
+				result?.processed_at ?? now,
+				String(result?.summary ?? ''),
+				String(result?.attendance_json ?? ''),
+				result?.needs_human_review ? 1 : 0,
+				Number(result?.confidence ?? 0),
+				String(result?.appscript_response ?? ''),
+				now,
+				rowId,
+			],
+			(err) => {
+				db.close();
+				if (err) {
+					reject(err);
+					return;
+				}
+				resolve();
+			},
+		);
+	});
+}
+
+function markQueueRowAsNeedsReview(rowId, error) {
+	const responsePayload = {
+		mode: 'clarification_request',
+		source: 'bridge_fallback',
+		question: 'Mình đang xử lý chậm ở bước hiểu ngữ cảnh. Bạn gửi lại giúp mình theo mẫu: Công trình + Ngày + Buổi + danh sách nhân sự nhé.',
+		notes: [String(error?.message ?? error)],
+	};
+	const result = {
+		status: 'needs_review',
+		processed_at: new Date().toISOString(),
+		summary: 'Bridge fallback: chuyển sang needs_review để tránh block hàng đợi.',
+		attendance_json: '',
+		needs_human_review: true,
+		confidence: 0,
+		appscript_response: JSON.stringify(responsePayload),
+		reply_text: responsePayload.question,
+	};
+	return updateQueueRowAfterConversation(rowId, result).then(() => result);
+}
+
+async function processQueuedMessageNow(rowId, payload) {
+	const contextUrl = String(process.env.OPENCLAW_CONTEXT_URL ?? 'http://127.0.0.1:20129/analyze').trim().replace(/\/analyze$/i, '/handle');
+	try {
+		const response = await fetch(contextUrl, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify(payload),
+		});
+		const text = await response.text();
+		let parsed;
+		try {
+			parsed = JSON.parse(text);
+		} catch (error) {
+			throw new Error(`OpenClaw handle returned invalid JSON: ${error.message}`);
+		}
+		if (!parsed?.ok || !parsed?.result) {
+			throw new Error(parsed?.error || 'OpenClaw handle did not return a result');
+		}
+		await updateQueueRowAfterConversation(rowId, parsed.result);
+		return parsed.result;
+	} catch (error) {
+		return markQueueRowAsNeedsReview(rowId, error);
+	}
+}
+
 async function sendPendingZaloReplies() {
 	if (!activeApi) {
 		return;
@@ -658,6 +749,29 @@ async function main() {
 			log(`Queued message ${result.messageId || '(no-msg-id)'} from thread ${result.threadId || '(no-thread)'}`);
 			void sendTypingForThread(result.threadId);
 			void sendProcessingAck(result.threadId);
+
+			const conversationResult = await processQueuedMessageNow(result.rowId, {
+				thread_id: String(message?.threadId ?? ''),
+				group_name: String(message?.data?.dName ?? ''),
+				sender_id: String(message?.data?.uidFrom ?? ''),
+				sender_name: String(message?.data?.displayName ?? message?.data?.dName ?? ''),
+				message_text: String(message?.data?.content ?? '').trim(),
+				message_ts: String(message?.data?.ts ?? ''),
+				queue_key: String(result.queueKey ?? ''),
+			});
+
+			const replyText = cleanText(conversationResult?.reply_text);
+			if (replyText) {
+				try {
+					await activeApi.sendTypingEvent(String(result.threadId), ThreadType.Group).catch(() => undefined);
+					await activeApi.sendMessage({ msg: replyText }, String(result.threadId), ThreadType.Group);
+					await markZaloReplySent(result.rowId, replyText);
+					log(`Sent immediate Zalo reply for queue row ${result.rowId}`);
+				} catch (replyError) {
+					await markZaloReplyFailed(result.rowId, replyError);
+					log(`Failed to send immediate Zalo reply for queue row ${result.rowId}: ${replyError.message}`);
+				}
+			}
 		} catch (error) {
 			log(`Failed to queue message: ${error.message}`);
 		}
