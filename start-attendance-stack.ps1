@@ -1,5 +1,7 @@
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+powershell -ExecutionPolicy Bypass -File (Join-Path $root 'start-openclaw-context.ps1') | Out-Host
+
 powershell -ExecutionPolicy Bypass -File (Join-Path $root 'start-n8n.ps1') | Out-Host
 
 $deadline = (Get-Date).AddSeconds(45)

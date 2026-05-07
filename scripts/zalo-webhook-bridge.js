@@ -13,6 +13,8 @@ const QUEUE_TABLE =
 
 let activeApi;
 let replyPollTimer;
+let typingPollTimer;
+const processingAckByThread = new Map();
 
 function log(message, extra) {
 	const stamp = new Date().toISOString();
@@ -86,6 +88,49 @@ function loadZaloCredential() {
 	});
 }
 
+function looksLikeFullAttendanceMessage(text) {
+	const source = String(text ?? '').trim();
+	if (!source) return false;
+	const hasProject = /^\s*(ct|công\s*trình)/im.test(source);
+	const hasDate = /(\d{4})-(\d{2})-(\d{2})|(\d{1,2})\/(\d{1,2})\/(\d{4})/.test(source);
+	const hasShift = /\b(buổi|ca)\b[\s.:_-]*(sáng|chiều|tối|đêm|ngày)/i.test(source);
+	const hasWorkerLine = /^\s*\d+[.)]\s*\S+/m.test(source);
+	return hasProject && hasDate && hasShift && hasWorkerLine;
+}
+
+function supersedeOlderPendingRows(threadId, currentQueueKey, messageText) {
+	if (!looksLikeFullAttendanceMessage(messageText)) {
+		return Promise.resolve(0);
+	}
+
+	const sql = `
+		update "${QUEUE_TABLE}"
+		set status = 'ignored',
+			processed_at = ?,
+			summary = ?,
+			last_error = '',
+			updatedAt = ?
+		where thread_id = ?
+			and queue_key != ?
+			and coalesce(status, '') = 'pending'
+	`;
+	const now = new Date().toISOString().replace('T', ' ').replace('Z', '');
+	const summary = 'Tin pending cũ trong cùng thread đã được bỏ qua để ưu tiên bản chấm công đầy đủ mới hơn.';
+
+	return new Promise((resolve, reject) => {
+		const db = new sqlite3.Database(DB_PATH);
+		db.run(sql, [now, summary, now, String(threadId ?? ''), String(currentQueueKey ?? '')], function onRun(err) {
+			db.close();
+			if (err) {
+				reject(err);
+				return;
+			}
+
+			resolve(this.changes || 0);
+		});
+	});
+}
+
 function insertQueueRow(message) {
 	const text = message?.data?.content;
 	if (message?.isSelf) {
@@ -143,12 +188,28 @@ function insertQueueRow(message) {
 				return;
 			}
 
-			resolve({
-				inserted: this.changes > 0,
-				queueKey,
-				threadId,
-				messageId,
-			});
+			if (!(this.changes > 0)) {
+				resolve({
+					inserted: false,
+					queueKey,
+					threadId,
+					messageId,
+					superseded: 0,
+				});
+				return;
+			}
+
+			supersedeOlderPendingRows(threadId, queueKey, text.trim())
+				.then((superseded) => {
+					resolve({
+						inserted: true,
+						queueKey,
+						threadId,
+						messageId,
+						superseded,
+					});
+				})
+				.catch(reject);
 		});
 	});
 }
@@ -206,7 +267,11 @@ function parseLegacyReplyText(appscriptResponse) {
 	try {
 		const parsed = JSON.parse(appscriptResponse);
 		const clarificationQuestion = String(
-			parsed?.clarification_question ?? parsed?.validation?.clarification_question ?? '',
+			parsed?.clarification_question ??
+			parsed?.question ??
+			parsed?.validation?.clarification_question ??
+			parsed?.validation?.question ??
+			'',
 		).trim();
 		if (clarificationQuestion) {
 			return clarificationQuestion;
@@ -279,6 +344,27 @@ function humanizeLabel(value) {
 	return text.charAt(0).toLocaleUpperCase('vi-VN') + text.slice(1);
 }
 
+function normalizeProjectLabel(value) {
+	const text = cleanText(value);
+	if (!text) return '';
+
+	const withoutPrefix = text
+		.replace(/^c(t|ông\s*tr(ì|i)nh)\s*/i, '')
+		.replace(/^ct\s*/i, '')
+		.trim();
+
+	return humanizeLabel(withoutPrefix || text);
+}
+
+function extractProjectLabelFromSummary(summary) {
+	const text = cleanText(summary);
+	if (!text) return '';
+
+	const match = text.match(/công trình\s+(.+?)(?:\s+ngày|\s+buổi|\s+ca|,|$)/i);
+	if (!match) return '';
+	return normalizeProjectLabel(match[1]);
+}
+
 function hangMucFromScopeKeys(parsed) {
 	const scopeKeys = Array.isArray(parsed?.validation?.scopeKeys) ? parsed.validation.scopeKeys : parsed?.scopeKeys;
 	if (!Array.isArray(scopeKeys)) return '';
@@ -302,6 +388,11 @@ function naturalSavedAttendanceReply(parsed, row) {
 	const tasks = scopeHangMuc
 		? [scopeHangMuc]
 		: [...new Set(attendanceEntries.map((entry) => cleanText(entry?.task || entry?.site)).filter(Boolean))];
+	const summaryProject = extractProjectLabelFromSummary(row?.summary);
+	const projectNames = [...new Set([
+		summaryProject,
+		...attendanceEntries.map((entry) => normalizeProjectLabel(entry?.site)),
+	].filter(Boolean))];
 	const projectCode = cleanText(parsed?.projectCode ?? parsed?.validation?.projectCode);
 	const warnings = Array.isArray(parsed?.validation?.warnings) ? parsed.validation.warnings : [];
 	const sameDayShiftWarnings = warnings.filter((warning) => warning?.type === 'employee_other_shift_same_day');
@@ -310,7 +401,9 @@ function naturalSavedAttendanceReply(parsed, row) {
 	const shiftText = shifts.length === 1 ? ` buổi ${shifts[0]}` : (shifts.length > 1 ? ` các buổi ${joinVietnameseList(shifts)}` : '');
 	const dateText = dates.length === 1 ? ` ngày ${dates[0]}` : (dates.length > 1 ? ` trong ${dates.length} ngày` : '');
 	const taskText = tasks.length === 1 ? ` ở hạng mục ${tasks[0]}` : '';
-	const projectText = projectCode ? ` cho công trình ${projectCode}` : '';
+	const projectText = projectNames.length === 1
+		? ` cho công trình ${projectNames[0]}`
+		: (projectCode ? ` cho công trình ${projectCode}` : '');
 	const warningText = sameDayShiftWarnings.length
 		? ' Mình thấy có người đã có ca khác cùng ngày, bạn kiểm tra lại nếu cần nhé.'
 		: '';
@@ -341,7 +434,11 @@ function parseReplyText(appscriptResponse, row = {}) {
 	try {
 		const parsed = JSON.parse(appscriptResponse);
 		const clarificationQuestion = String(
-			parsed?.clarification_question ?? parsed?.validation?.clarification_question ?? '',
+			parsed?.clarification_question ??
+			parsed?.question ??
+			parsed?.validation?.clarification_question ??
+			parsed?.validation?.question ??
+			'',
 		).trim();
 		if (clarificationQuestion) {
 			return clarificationQuestion;
@@ -361,7 +458,8 @@ function getPendingZaloReplies() {
 		where coalesce(zalo_reply_sent, 0) = 0
 			and coalesce(zalo_reply_attempts, 0) < 3
 			and coalesce(appscript_response, '') != ''
-		order by id asc
+			and coalesce(status, '') in ('done', 'needs_review', 'clarification_sent')
+		order by id desc
 		limit 10
 	`;
 
@@ -377,6 +475,67 @@ function getPendingZaloReplies() {
 			resolve(rows);
 		});
 	});
+}
+
+function getPendingTypingThreads() {
+	const sql = `
+		select distinct thread_id
+		from "${QUEUE_TABLE}"
+		where coalesce(status, '') = 'pending'
+			and coalesce(message_text, '') != ''
+			and createdAt >= datetime('now', '-10 minutes')
+		order by id desc
+		limit 10
+	`;
+
+	return new Promise((resolve, reject) => {
+		const db = new sqlite3.Database(DB_PATH);
+		db.all(sql, (err, rows) => {
+			db.close();
+			if (err) {
+				reject(err);
+				return;
+			}
+
+			resolve(rows.map((row) => String(row.thread_id || '')).filter(Boolean));
+		});
+	});
+}
+
+async function sendTypingForThread(threadId) {
+	if (!activeApi || !threadId) {
+		return;
+	}
+
+	try {
+		await activeApi.sendTypingEvent(String(threadId), ThreadType.Group).catch(() => undefined);
+	} catch (_error) {
+		// best effort only
+	}
+}
+
+async function sendProcessingAck(threadId) {
+	if (!activeApi || !threadId) {
+		return;
+	}
+
+	const now = Date.now();
+	const lastSentAt = Number(processingAckByThread.get(String(threadId)) || 0);
+	if (now - lastSentAt < 15000) {
+		return;
+	}
+
+	processingAckByThread.set(String(threadId), now);
+
+	try {
+		await activeApi.sendMessage(
+			{ msg: 'Đã nhận tin, mình đang xử lý chấm công cho bạn...' },
+			String(threadId),
+			ThreadType.Group,
+		);
+	} catch (_error) {
+		// best effort only
+	}
 }
 
 function markZaloReplySent(rowId, replyText) {
@@ -454,6 +613,17 @@ async function sendPendingZaloReplies() {
 	}
 }
 
+async function sendTypingIndicators() {
+	if (!activeApi) {
+		return;
+	}
+
+	const threadIds = await getPendingTypingThreads();
+	for (const threadId of threadIds) {
+		await sendTypingForThread(threadId);
+	}
+}
+
 async function main() {
 	const credential = await loadZaloCredential();
 	log(`Loaded credential "${credential.name}" (${credential.id})`);
@@ -486,6 +656,8 @@ async function main() {
 			}
 
 			log(`Queued message ${result.messageId || '(no-msg-id)'} from thread ${result.threadId || '(no-thread)'}`);
+			void sendTypingForThread(result.threadId);
+			void sendProcessingAck(result.threadId);
 		} catch (error) {
 			log(`Failed to queue message: ${error.message}`);
 		}
@@ -495,7 +667,11 @@ async function main() {
 	replyPollTimer = setInterval(() => {
 		void sendPendingZaloReplies().catch((error) => log(`Reply poll failed: ${error.message}`));
 	}, 5000);
+	typingPollTimer = setInterval(() => {
+		void sendTypingIndicators().catch((error) => log(`Typing poll failed: ${error.message}`));
+	}, 4000);
 	void sendPendingZaloReplies().catch((error) => log(`Initial reply poll failed: ${error.message}`));
+	void sendTypingIndicators().catch((error) => log(`Initial typing poll failed: ${error.message}`));
 	log('Zalo listener started');
 }
 
@@ -507,6 +683,9 @@ async function shutdown(signal) {
 		}
 		if (replyPollTimer) {
 			clearInterval(replyPollTimer);
+		}
+		if (typingPollTimer) {
+			clearInterval(typingPollTimer);
 		}
 	} catch (error) {
 		log(`Listener stop warning: ${error.message}`);
