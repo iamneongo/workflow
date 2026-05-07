@@ -914,6 +914,16 @@ async function handleConversation(payload) {
 
   if (documentType !== 'attendance' || !attendanceEntries.length) {
     const question = cleanText(analysis.question);
+    const replyText = question
+      ? await generateNativeReply(payload, {
+          mode: 'ask_clarification',
+          pendingQuestion: getThreadState(cleanText(payload?.thread_id))?.pending_clarification?.question,
+          recentTurns: getThreadState(cleanText(payload?.thread_id))?.recent_turns,
+          attendanceEntries,
+          missingFields: extractMissingFields(analysis),
+          fallbackReply: question,
+        })
+      : '';
     const result = {
       status: question ? 'needs_review' : 'ignored',
       processed_at: processedAt,
@@ -922,7 +932,7 @@ async function handleConversation(payload) {
       needs_human_review: Boolean(question || analysis.needs_human_review),
       confidence: Number(analysis.confidence ?? 0),
       appscript_response: JSON.stringify(question ? buildClarificationPayload(analysis) : { skipped: true, reason: 'non-attendance-or-empty' }),
-      reply_text: question,
+      reply_text: replyText,
     };
     updateThreadStateFromResult(payload?.thread_id, payload, result);
     return result;
@@ -930,6 +940,14 @@ async function handleConversation(payload) {
 
   if (cleanText(analysis.action) === 'ask_clarification' || analysis.needs_human_review) {
     const question = cleanText(analysis.question) || 'Mình cần bạn xác nhận thêm một chút để ghi chấm công đúng nhé.';
+    const replyText = await generateNativeReply(payload, {
+      mode: 'ask_clarification',
+      pendingQuestion: getThreadState(cleanText(payload?.thread_id))?.pending_clarification?.question,
+      recentTurns: getThreadState(cleanText(payload?.thread_id))?.recent_turns,
+      attendanceEntries,
+      missingFields: getMissingFieldsFromDraft(attendanceEntries),
+      fallbackReply: question,
+    });
     const result = {
       status: 'needs_review',
       processed_at: processedAt,
@@ -938,7 +956,7 @@ async function handleConversation(payload) {
       needs_human_review: true,
       confidence: Number(analysis.confidence ?? 0),
       appscript_response: JSON.stringify(buildClarificationPayload(analysis, { question })),
-      reply_text: question,
+      reply_text: replyText,
     };
     updateThreadStateFromResult(payload?.thread_id, payload, result);
     return result;
@@ -958,6 +976,17 @@ async function handleConversation(payload) {
   const validation = await postAppsScriptJson(basePayload);
   if (validation.valid === false) {
     const question = cleanText(validation.clarification_question) || cleanText(analysis.question) || 'Mình thấy có dữ liệu cần xác nhận lại trước khi ghi sheet.';
+    const replyText = await generateNativeReply(payload, {
+      mode: 'ask_clarification',
+      pendingQuestion: getThreadState(cleanText(payload?.thread_id))?.pending_clarification?.question,
+      recentTurns: getThreadState(cleanText(payload?.thread_id))?.recent_turns,
+      attendanceEntries,
+      missingFields: getMissingFieldsFromDraft(attendanceEntries),
+      validationConflicts: Array.isArray(validation.conflicts) ? validation.conflicts : [],
+      validationWarnings: Array.isArray(validation.warnings) ? validation.warnings : [],
+      projectName: normalizeProjectLabel(attendanceEntries[0]?.site),
+      fallbackReply: question,
+    });
     const result = {
       status: 'needs_review',
       processed_at: processedAt,
@@ -974,7 +1003,7 @@ async function handleConversation(payload) {
           ? validation.conflicts.map((conflict) => cleanText(conflict?.type)).filter(Boolean)
           : [],
       })),
-      reply_text: question,
+      reply_text: replyText,
     };
     updateThreadStateFromResult(payload?.thread_id, payload, result);
     return result;
@@ -992,6 +1021,14 @@ async function handleConversation(payload) {
     validation_snapshot: validation,
   });
 
+  const savedReply = await generateNativeReply(payload, {
+    mode: 'save_confirmation',
+    recentTurns: getThreadState(cleanText(payload?.thread_id))?.recent_turns,
+    attendanceEntries,
+    validationWarnings: Array.isArray(saved?.validation?.warnings) ? saved.validation.warnings : [],
+    projectName: normalizeProjectLabel(attendanceEntries[0]?.site),
+    fallbackReply: buildSavedReply(attendanceEntries, saved),
+  });
   const result = {
     status: 'done',
     processed_at: processedAt,
@@ -1000,7 +1037,7 @@ async function handleConversation(payload) {
     needs_human_review: false,
     confidence: Number(analysis.confidence ?? 0),
     appscript_response: JSON.stringify(saved),
-    reply_text: buildSavedReply(attendanceEntries, saved),
+    reply_text: savedReply,
   };
   updateThreadStateFromResult(payload?.thread_id, payload, result);
   return result;
@@ -1316,6 +1353,132 @@ function updateThreadStateFromResult(threadId, payload, result) {
   });
 }
 
+function invokeOpenClawJson(sessionId, prompt, timeoutMs = REQUEST_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    log(`OpenClaw prompt length for thread ${sessionId || '(no-session)'}: ${prompt.length}`);
+    const commandArgs = [
+      ...OPENCLAW_LAUNCH.prefixArgs,
+      'agent',
+      '--local',
+      '--session-id',
+      sessionId,
+      '--message',
+      prompt,
+      '--json',
+    ];
+
+    const child = spawn(OPENCLAW_LAUNCH.command, commandArgs, {
+      cwd: process.cwd(),
+      windowsHide: true,
+      shell: false,
+      env: process.env,
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let finished = false;
+
+    const timer = setTimeout(() => {
+      if (finished) return;
+      finished = true;
+      child.kill();
+      reject(new Error(`OpenClaw request timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString('utf8');
+    });
+
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf8');
+    });
+
+    child.on('error', (error) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      reject(error);
+    });
+
+    child.on('close', (code) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+
+      const merged = `${stdout}\n${stderr}`.trim();
+      if (code !== 0) {
+        reject(new Error(`OpenClaw exited with code ${code}. ${merged || 'No output.'}`.trim()));
+        return;
+      }
+
+      try {
+        const outerText = extractBalancedObject(merged) || normalizeJsonText(merged);
+        if (!outerText) {
+          throw new Error('OpenClaw returned empty output.');
+        }
+        const outer = JSON.parse(outerText);
+        const text = normalizeJsonText(outer?.payloads?.[0]?.text ?? '');
+        if (!text) {
+          throw new Error('OpenClaw returned no text payload.');
+        }
+        resolve({ outer, text, stdout, stderr });
+      } catch (error) {
+        reject(new Error(`Failed to parse OpenClaw output: ${error.message}\nstdout=${stdout}\nstderr=${stderr}`));
+      }
+    });
+  });
+}
+
+function buildNativeReplyPrompt(options = {}) {
+  const mode = cleanText(options.mode);
+  const instructions = [
+    'Bạn là trợ lý chấm công Zalo của doanh nghiệp xây dựng.',
+    'Trả về đúng một object JSON minified với khóa duy nhất reply_text.',
+    'Câu trả lời phải tự nhiên, ngắn gọn, thân thiện, không robot.',
+    'Không yêu cầu người dùng gửi lại toàn bộ mẫu nếu backend đã biết bản nháp hiện tại.',
+    'Nếu đang hỏi bổ sung, chỉ hỏi đúng 1 ý còn thiếu hoặc 1 xung đột cần xác nhận.',
+    'Nếu đã lưu thành công, xác nhận rõ ai, ngày nào, buổi nào, hạng mục nào, công trình nào.',
+    'Nếu có dữ liệu xác thực từ sheet, ưu tiên dùng nó để nói chính xác.',
+  ].join(' ');
+
+  const payload = {
+    mode,
+    current_user_message: cleanText(options.currentMessage),
+    thread_state: {
+      pending_question: cleanText(options.pendingQuestion),
+      recent_turns: (Array.isArray(options.recentTurns) ? options.recentTurns : []).slice(-4).map((turn) => ({
+        role: cleanText(turn?.role),
+        text: truncateText(turn?.text, 180),
+      })),
+    },
+    draft_attendance: summarizeEntries(options.attendanceEntries),
+    missing_fields: Array.isArray(options.missingFields) ? options.missingFields : [],
+    validation_conflicts: Array.isArray(options.validationConflicts) ? options.validationConflicts : [],
+    validation_warnings: Array.isArray(options.validationWarnings) ? options.validationWarnings : [],
+    project_name: cleanText(options.projectName),
+    fallback_reply: cleanText(options.fallbackReply),
+  };
+
+  return `INSTRUCTIONS=${instructions} || REPLY_CONTEXT=${JSON.stringify(payload)}`;
+}
+
+async function generateNativeReply(payload, options = {}) {
+  const fallbackReply = cleanText(options.fallbackReply);
+  try {
+    const sessionId = `${sanitizeSessionId(payload?.thread_id)}__reply`;
+    const prompt = buildNativeReplyPrompt({
+      ...options,
+      currentMessage: payload?.message_text,
+    });
+    const { text } = await invokeOpenClawJson(sessionId, prompt, Math.min(REQUEST_TIMEOUT_MS, 8000));
+    const parsed = parseJsonSafe(text, {});
+    const replyText = cleanText(parsed?.reply_text);
+    return replyText || fallbackReply;
+  } catch (_error) {
+    return fallbackReply;
+  }
+}
+
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let raw = '';
@@ -1424,72 +1587,9 @@ async function runOpenClaw(payload) {
       lastAnalysis: threadState.last_analysis,
       existingAttendance,
     });
-    log(`OpenClaw prompt length for thread ${threadId || '(no-thread)'}: ${prompt.length}`);
-    const commandArgs = [
-      ...OPENCLAW_LAUNCH.prefixArgs,
-      'agent',
-      '--local',
-      '--session-id',
-      sessionId,
-      '--message',
-      prompt,
-      '--json',
-    ];
 
-    const child = spawn(OPENCLAW_LAUNCH.command, commandArgs, {
-      cwd: process.cwd(),
-      windowsHide: true,
-      shell: false,
-      env: process.env,
-    });
-
-    let stdout = '';
-    let stderr = '';
-    let finished = false;
-
-    const timer = setTimeout(() => {
-      if (finished) return;
-      finished = true;
-      child.kill();
-      reject(new Error(`OpenClaw request timed out after ${REQUEST_TIMEOUT_MS}ms`));
-    }, REQUEST_TIMEOUT_MS);
-
-    child.stdout.on('data', (chunk) => {
-      stdout += chunk.toString('utf8');
-    });
-
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString('utf8');
-    });
-
-    child.on('error', (error) => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-      reject(error);
-    });
-
-    child.on('close', (code) => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-
-      const merged = `${stdout}\n${stderr}`.trim();
-      if (code !== 0) {
-        reject(new Error(`OpenClaw exited with code ${code}. ${merged || 'No output.'}`.trim()));
-        return;
-      }
-
-      try {
-        const outerText = extractBalancedObject(merged) || normalizeJsonText(merged);
-        if (!outerText) {
-          throw new Error('OpenClaw returned empty output.');
-        }
-        const outer = JSON.parse(outerText);
-        const text = normalizeJsonText(outer?.payloads?.[0]?.text ?? '');
-        if (!text) {
-          throw new Error('OpenClaw returned no text payload.');
-        }
+    invokeOpenClawJson(sessionId, prompt, REQUEST_TIMEOUT_MS)
+      .then(({ outer, text }) => {
         const analysis = normalizeAnalysisShape(JSON.parse(text));
         updateThreadState(threadId, payload, analysis, recentHistory);
         resolve({
@@ -1497,10 +1597,8 @@ async function runOpenClaw(payload) {
           analysis,
           raw: outer,
         });
-      } catch (error) {
-        reject(new Error(`Failed to parse OpenClaw output: ${error.message}\nstdout=${stdout}\nstderr=${stderr}`));
-      }
-    });
+      })
+      .catch(reject);
   });
 }
 
